@@ -3,7 +3,6 @@ package discovery
 import (
 	"sync"
 
-	"github.com/btcsuite/btcd/btcec"
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
@@ -16,9 +15,7 @@ type reliableSenderCfg struct {
 	// retry sending a peer message.
 	//
 	// NOTE: The peerChan channel must be buffered.
-	//
-	// TODO(wilmer): use [33]byte to avoid unnecessary serializations.
-	NotifyWhenOnline func(peer *btcec.PublicKey, peerChan chan<- lnpeer.Peer)
+	NotifyWhenOnline func(peerPubKey [33]byte, peerChan chan<- lnpeer.Peer)
 
 	// NotifyWhenOffline is a function that allows the gossiper to be
 	// notified when a certain peer disconnects, allowing it to request a
@@ -164,13 +161,12 @@ func (s *reliableSender) peerHandler(peerMgr peerManager, peerPubKey [33]byte) {
 
 	// We'll start by requesting a notification for when the peer
 	// reconnects.
-	pubKey, _ := btcec.ParsePubKey(peerPubKey[:], btcec.S256())
 	peerChan := make(chan lnpeer.Peer, 1)
 
 waitUntilOnline:
 	log.Debugf("Requesting online notification for peer=%x", peerPubKey)
 
-	s.cfg.NotifyWhenOnline(pubKey, peerChan)
+	s.cfg.NotifyWhenOnline(peerPubKey, peerChan)
 
 	var peer lnpeer.Peer
 out:
@@ -181,9 +177,19 @@ out:
 		// ignored for now since the peer is currently offline. Once
 		// they reconnect, the messages will be sent since they should
 		// have been persisted to disk.
-		case <-peerMgr.msgs:
+		case msg := <-peerMgr.msgs:
+			// Retrieve the short channel ID for which this message
+			// applies for logging purposes. The error can be
+			// ignored as the store can only contain messages which
+			// have a ShortChannelID field.
+			shortChanID, _ := msgShortChanID(msg)
+			log.Debugf("Received request to send %v message for "+
+				"channel=%v while peer=%x is offline",
+				msg.MsgType(), shortChanID, peerPubKey)
+
 		case peer = <-peerChan:
 			break out
+
 		case <-s.quit:
 			return
 		}
@@ -214,6 +220,14 @@ out:
 		// for logging purposes. The error can be ignored as the store
 		// can only contain messages which have a ShortChannelID field.
 		shortChanID, _ := msgShortChanID(msg)
+
+		// Ensure the peer is still online right before sending the
+		// message.
+		select {
+		case <-offlineChan:
+			goto waitUntilOnline
+		default:
+		}
 
 		if err := peer.SendMessage(false, msg); err != nil {
 			log.Errorf("Unable to send %v message for channel=%v "+

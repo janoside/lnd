@@ -9,8 +9,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
-// Peer is an interface which represents the remote lightning node inside our
-// system.
+// Peer is an interface which represents a remote lightning node.
 type Peer interface {
 	// SendMessage sends a variadic number of high-priority message to
 	// remote peer.  The first argument denotes if the method should block
@@ -30,7 +29,7 @@ type Peer interface {
 
 	// WipeChannel removes the channel uniquely identified by its channel
 	// point from all indexes associated with the peer.
-	WipeChannel(*wire.OutPoint) error
+	WipeChannel(*wire.OutPoint)
 
 	// PubKey returns the serialized public key of the remote peer.
 	PubKey() [33]byte
@@ -46,4 +45,15 @@ type Peer interface {
 	// using the interface to cancel any processing in the event the backing
 	// implementation exits.
 	QuitSignal() <-chan struct{}
+
+	// LocalFeatures returns the set of features that has been advertised by
+	// the us to the remote peer. This allows sub-systems that use this
+	// interface to gate their behavior off the set of negotiated feature
+	// bits.
+	LocalFeatures() *lnwire.FeatureVector
+
+	// RemoteFeatures returns the set of features that has been advertised
+	// by the remote peer. This allows sub-systems that use this interface
+	// to gate their behavior off the set of negotiated feature bits.
+	RemoteFeatures() *lnwire.FeatureVector
 }

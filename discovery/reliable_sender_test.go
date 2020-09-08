@@ -8,6 +8,7 @@ import (
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/lnpeer"
+	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lnwire"
 )
 
@@ -17,9 +18,13 @@ func newTestReliableSender(t *testing.T) *reliableSender {
 	t.Helper()
 
 	cfg := &reliableSenderCfg{
-		NotifyWhenOnline: func(pubKey *btcec.PublicKey,
+		NotifyWhenOnline: func(pubKey [33]byte,
 			peerChan chan<- lnpeer.Peer) {
-			peerChan <- &mockPeer{pk: pubKey}
+			pk, err := btcec.ParsePubKey(pubKey[:], btcec.S256())
+			if err != nil {
+				t.Fatalf("unable to parse pubkey: %v", err)
+			}
+			peerChan <- &mockPeer{pk: pk}
 		},
 		NotifyWhenOffline: func(_ [33]byte) <-chan struct{} {
 			c := make(chan struct{}, 1)
@@ -59,29 +64,6 @@ func assertMsgsSent(t *testing.T, msgChan chan lnwire.Message,
 	}
 }
 
-// waitPredicate is a helper test function that will wait for a timeout period
-// of time until the passed predicate returns true.
-func waitPredicate(t *testing.T, timeout time.Duration, pred func() bool) {
-	t.Helper()
-
-	const pollInterval = 20 * time.Millisecond
-	exitTimer := time.After(timeout)
-
-	for {
-		<-time.After(pollInterval)
-
-		select {
-		case <-exitTimer:
-			t.Fatalf("predicate not satisfied after timeout")
-		default:
-		}
-
-		if pred() {
-			return
-		}
-	}
-}
-
 // TestReliableSenderFlow ensures that the flow for sending messages reliably to
 // a peer while taking into account its connection lifecycle works as expected.
 func TestReliableSenderFlow(t *testing.T) {
@@ -100,7 +82,7 @@ func TestReliableSenderFlow(t *testing.T) {
 	notifyOnline := make(chan chan<- lnpeer.Peer, 2)
 	notifyOffline := make(chan chan struct{}, 1)
 
-	reliableSender.cfg.NotifyWhenOnline = func(_ *btcec.PublicKey,
+	reliableSender.cfg.NotifyWhenOnline = func(_ [33]byte,
 		peerChan chan<- lnpeer.Peer) {
 		notifyOnline <- peerChan
 	}
@@ -216,7 +198,7 @@ func TestReliableSenderStaleMessages(t *testing.T) {
 	// Override NotifyWhenOnline to provide the notification channel so that
 	// we can control when notifications get dispatched.
 	notifyOnline := make(chan chan<- lnpeer.Peer, 1)
-	reliableSender.cfg.NotifyWhenOnline = func(_ *btcec.PublicKey,
+	reliableSender.cfg.NotifyWhenOnline = func(_ [33]byte,
 		peerChan chan<- lnpeer.Peer) {
 		notifyOnline <- peerChan
 	}
@@ -262,27 +244,23 @@ func TestReliableSenderStaleMessages(t *testing.T) {
 	// message store since it is seen as stale and has been sent at least
 	// once. Once the message is removed, the peerHandler should be torn
 	// down as there are no longer any pending messages within the store.
-	var predErr error
-	waitPredicate(t, time.Second, func() bool {
+	err := wait.NoError(func() error {
 		msgs, err := reliableSender.cfg.MessageStore.MessagesForPeer(
 			peerPubKey,
 		)
 		if err != nil {
-			predErr = fmt.Errorf("unable to retrieve messages for "+
+			return fmt.Errorf("unable to retrieve messages for "+
 				"peer: %v", err)
-			return false
 		}
 		if len(msgs) != 0 {
-			predErr = fmt.Errorf("expected to not find any "+
+			return fmt.Errorf("expected to not find any "+
 				"messages for peer, found %d", len(msgs))
-			return false
 		}
 
-		predErr = nil
-		return true
-	})
-	if predErr != nil {
-		t.Fatal(predErr)
+		return nil
+	}, time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Override IsMsgStale to no longer mark messages as stale.

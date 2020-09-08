@@ -3,7 +3,6 @@ package autopilot
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/lightningnetwork/lnd/lnwallet"
@@ -40,8 +39,8 @@ type ManagerCfg struct {
 // It implements the autopilot grpc service, which is used to get data about
 // the running autopilot, and give it relevant information.
 type Manager struct {
-	started uint32 // To be used atomically.
-	stopped uint32 // To be used atomically.
+	started sync.Once
+	stopped sync.Once
 
 	cfg *ManagerCfg
 
@@ -64,27 +63,21 @@ func NewManager(cfg *ManagerCfg) (*Manager, error) {
 
 // Start starts the Manager.
 func (m *Manager) Start() error {
-	if !atomic.CompareAndSwapUint32(&m.started, 0, 1) {
-		return nil
-	}
-
+	m.started.Do(func() {})
 	return nil
 }
 
 // Stop stops the Manager. If an autopilot agent is active, it will also be
 // stopped.
 func (m *Manager) Stop() error {
-	if !atomic.CompareAndSwapUint32(&m.stopped, 0, 1) {
-		return nil
-	}
+	m.stopped.Do(func() {
+		if err := m.StopAgent(); err != nil {
+			log.Errorf("Unable to stop pilot: %v", err)
+		}
 
-	if err := m.StopAgent(); err != nil {
-		log.Errorf("Unable to stop pilot: %v", err)
-	}
-
-	close(m.quit)
-	m.wg.Wait()
-
+		close(m.quit)
+		m.wg.Wait()
+	})
 	return nil
 }
 
@@ -326,8 +319,12 @@ func (m *Manager) queryHeuristics(nodes map[NodeID]struct{}, localState bool) (
 
 	// We'll start by getting the scores from each available sub-heuristic,
 	// in addition the current agent heuristic.
+	var heuristics []AttachmentHeuristic
+	heuristics = append(heuristics, availableHeuristics...)
+	heuristics = append(heuristics, m.cfg.PilotCfg.Heuristic)
+
 	report := make(HeuristicScores)
-	for _, h := range append(availableHeuristics, m.cfg.PilotCfg.Heuristic) {
+	for _, h := range heuristics {
 		name := h.Name()
 
 		// If the agent heuristic is among the simple heuristics it
@@ -361,6 +358,9 @@ func (m *Manager) queryHeuristics(nodes map[NodeID]struct{}, localState bool) (
 // SetNodeScores is used to set the scores of the given heuristic, if it is
 // active, and ScoreSettable.
 func (m *Manager) SetNodeScores(name string, scores map[NodeID]float64) error {
+	m.Lock()
+	defer m.Unlock()
+
 	// It must be ScoreSettable to be available for external
 	// scores.
 	s, ok := m.cfg.PilotCfg.Heuristic.(ScoreSettable)
@@ -377,6 +377,12 @@ func (m *Manager) SetNodeScores(name string, scores map[NodeID]float64) error {
 
 	if !applied {
 		return fmt.Errorf("heuristic with name %v not found", name)
+	}
+
+	// If the autopilot agent is active, notify about the updated
+	// heuristic.
+	if m.pilot != nil {
+		m.pilot.OnHeuristicUpdate(m.cfg.PilotCfg.Heuristic)
 	}
 
 	return nil

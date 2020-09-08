@@ -1,5 +1,3 @@
-// +build dev
-
 package lookout_test
 
 import (
@@ -144,7 +142,13 @@ func testJusticeDescriptor(t *testing.T, blobType blob.Type) {
 
 	// Compute the weight estimate for our justice transaction.
 	var weightEstimate input.TxWeightEstimator
-	weightEstimate.AddWitnessInput(input.ToLocalPenaltyWitnessSize)
+
+	// An older ToLocalPenaltyWitnessSize constant used to underestimate the
+	// size by one byte. The diferrence in weight can cause different output
+	// values on the sweep transaction, so we mimic the original bug and
+	// create signatures using the original weight estimate.
+	weightEstimate.AddWitnessInput(input.ToLocalPenaltyWitnessSize - 1)
+
 	weightEstimate.AddWitnessInput(input.P2WKHWitnessSize)
 	weightEstimate.AddP2WKHOutput()
 	if blobType.Has(blob.FlagReward) {
@@ -156,9 +160,11 @@ func testJusticeDescriptor(t *testing.T, blobType blob.Type) {
 	// parameters that should be used in constructing the justice
 	// transaction.
 	policy := wtpolicy.Policy{
-		BlobType:     blobType,
-		SweepFeeRate: 2000,
-		RewardRate:   900000,
+		TxPolicy: wtpolicy.TxPolicy{
+			BlobType:     blobType,
+			SweepFeeRate: 2000,
+			RewardRate:   900000,
+		},
 	}
 	sessionInfo := &wtdb.SessionInfo{
 		Policy:        policy,
@@ -252,7 +258,7 @@ func testJusticeDescriptor(t *testing.T, blobType blob.Type) {
 	// DER-encoded signature under the to-remote pubkey. The sighash flag is
 	// also present, so we trim it.
 	toRemoteWitness, err := input.CommitSpendNoDelay(
-		signer, toRemoteSignDesc, justiceTxn,
+		signer, toRemoteSignDesc, justiceTxn, false,
 	)
 	if err != nil {
 		t.Fatalf("unable to sign to-remote input: %v", err)
@@ -260,7 +266,7 @@ func testJusticeDescriptor(t *testing.T, blobType blob.Type) {
 	toRemoteSigRaw := toRemoteWitness[0][:len(toRemoteWitness[0])-1]
 
 	// Convert the DER to-local sig into a fixed-size signature.
-	toLocalSig, err := lnwire.NewSigFromRawSignature(toLocalSigRaw)
+	toLocalSig, err := lnwire.NewSigFromSignature(toLocalSigRaw)
 	if err != nil {
 		t.Fatalf("unable to parse to-local signature: %v", err)
 	}
@@ -285,7 +291,7 @@ func testJusticeDescriptor(t *testing.T, blobType blob.Type) {
 	// over the buffered channel.
 	publications := make(chan *wire.MsgTx, 1)
 	punisher := lookout.NewBreachPunisher(&lookout.PunisherConfig{
-		PublishTx: func(tx *wire.MsgTx) error {
+		PublishTx: func(tx *wire.MsgTx, _ string) error {
 			publications <- tx
 			return nil
 		},
@@ -308,7 +314,7 @@ func testJusticeDescriptor(t *testing.T, blobType blob.Type) {
 
 	// Construct the test's to-local witness.
 	justiceTxn.TxIn[0].Witness = make([][]byte, 3)
-	justiceTxn.TxIn[0].Witness[0] = append(toLocalSigRaw,
+	justiceTxn.TxIn[0].Witness[0] = append(toLocalSigRaw.Serialize(),
 		byte(txscript.SigHashAll))
 	justiceTxn.TxIn[0].Witness[1] = []byte{1}
 	justiceTxn.TxIn[0].Witness[2] = toLocalScript

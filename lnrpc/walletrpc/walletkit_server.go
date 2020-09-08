@@ -4,17 +4,29 @@ package walletrpc
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"time"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/labels"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
-	"golang.org/x/net/context"
+	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/macaroons"
+	"github.com/lightningnetwork/lnd/sweep"
 	"google.golang.org/grpc"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 )
@@ -74,6 +86,34 @@ var (
 			Entity: "onchain",
 			Action: "read",
 		}},
+		"/walletrpc.WalletKit/PendingSweeps": {{
+			Entity: "onchain",
+			Action: "read",
+		}},
+		"/walletrpc.WalletKit/BumpFee": {{
+			Entity: "onchain",
+			Action: "write",
+		}},
+		"/walletrpc.WalletKit/ListSweeps": {{
+			Entity: "onchain",
+			Action: "read",
+		}},
+		"/walletrpc.WalletKit/LabelTransaction": {{
+			Entity: "onchain",
+			Action: "write",
+		}},
+		"/walletrpc.WalletKit/LeaseOutput": {{
+			Entity: "onchain",
+			Action: "write",
+		}},
+		"/walletrpc.WalletKit/ReleaseOutput": {{
+			Entity: "onchain",
+			Action: "write",
+		}},
+		"/walletrpc.WalletKit/ListUnspent": {{
+			Entity: "onchain",
+			Action: "read",
+		}},
 	}
 
 	// DefaultWalletKitMacFilename is the default name of the wallet kit
@@ -81,6 +121,10 @@ var (
 	// configuration file in this package.
 	DefaultWalletKitMacFilename = "walletkit.macaroon"
 )
+
+// ErrZeroLabel is returned when an attempt is made to label a transaction with
+// an empty label.
+var ErrZeroLabel = errors.New("cannot label transaction with empty label")
 
 // WalletKit is a sub-RPC server that exposes a tool kit which allows clients
 // to execute common wallet operations. This includes requesting new addresses,
@@ -113,8 +157,9 @@ func New(cfg *Config) (*WalletKit, lnrpc.MacaroonPerms, error) {
 		// At this point, we know that the wallet kit macaroon doesn't
 		// yet, exist, so we need to create it with the help of the
 		// main macaroon service.
-		walletKitMac, err := cfg.MacService.Oven.NewMacaroon(
-			context.Background(), bakery.LatestVersion, nil,
+		walletKitMac, err := cfg.MacService.NewMacaroon(
+			context.Background(),
+			macaroons.DefaultRootKeyID,
 			macaroonOps...,
 		)
 		if err != nil {
@@ -174,6 +219,142 @@ func (w *WalletKit) RegisterWithRootServer(grpcServer *grpc.Server) error {
 		"root gRPC server")
 
 	return nil
+}
+
+// RegisterWithRestServer will be called by the root REST mux to direct a sub
+// RPC server to register itself with the main REST mux server. Until this is
+// called, each sub-server won't be able to have requests routed towards it.
+//
+// NOTE: This is part of the lnrpc.SubServer interface.
+func (w *WalletKit) RegisterWithRestServer(ctx context.Context,
+	mux *runtime.ServeMux, dest string, opts []grpc.DialOption) error {
+
+	// We make sure that we register it with the main REST server to ensure
+	// all our methods are routed properly.
+	err := RegisterWalletKitHandlerFromEndpoint(ctx, mux, dest, opts)
+	if err != nil {
+		log.Errorf("Could not register WalletKit REST server "+
+			"with root REST server: %v", err)
+		return err
+	}
+
+	log.Debugf("WalletKit REST server successfully registered with " +
+		"root REST server")
+	return nil
+}
+
+// ListUnspent returns useful information about each unspent output owned by the
+// wallet, as reported by the underlying `ListUnspentWitness`; the information
+// returned is: outpoint, amount in satoshis, address, address type,
+// scriptPubKey in hex and number of confirmations.  The result is filtered to
+// contain outputs whose number of confirmations is between a
+// minimum and maximum number of confirmations specified by the user, with 0
+// meaning unconfirmed.
+func (w *WalletKit) ListUnspent(ctx context.Context,
+	req *ListUnspentRequest) (*ListUnspentResponse, error) {
+
+	// Validate the confirmation arguments.
+	minConfs, maxConfs, err := lnrpc.ParseConfs(req.MinConfs, req.MaxConfs)
+	if err != nil {
+		return nil, err
+	}
+
+	// With our arguments validated, we'll query the internal wallet for
+	// the set of UTXOs that match our query.
+	//
+	// We'll acquire the global coin selection lock to ensure there aren't
+	// any other concurrent processes attempting to lock any UTXOs which may
+	// be shown available to us.
+	var utxos []*lnwallet.Utxo
+	err = w.cfg.CoinSelectionLocker.WithCoinSelectLock(func() error {
+		utxos, err = w.cfg.Wallet.ListUnspentWitness(minConfs, maxConfs)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	rpcUtxos, err := lnrpc.MarshalUtxos(utxos, w.cfg.ChainParams)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ListUnspentResponse{
+		Utxos: rpcUtxos,
+	}, nil
+}
+
+// LeaseOutput locks an output to the given ID, preventing it from being
+// available for any future coin selection attempts. The absolute time of the
+// lock's expiration is returned. The expiration of the lock can be extended by
+// successive invocations of this call. Outputs can be unlocked before their
+// expiration through `ReleaseOutput`.
+//
+// If the output is not known, wtxmgr.ErrUnknownOutput is returned. If the
+// output has already been locked to a different ID, then
+// wtxmgr.ErrOutputAlreadyLocked is returned.
+func (w *WalletKit) LeaseOutput(ctx context.Context,
+	req *LeaseOutputRequest) (*LeaseOutputResponse, error) {
+
+	if len(req.Id) != 32 {
+		return nil, errors.New("id must be 32 random bytes")
+	}
+	var lockID wtxmgr.LockID
+	copy(lockID[:], req.Id)
+
+	// Don't allow ID's of 32 bytes, but all zeros.
+	if lockID == (wtxmgr.LockID{}) {
+		return nil, errors.New("id must be 32 random bytes")
+	}
+
+	op, err := unmarshallOutPoint(req.Outpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// Acquire the global coin selection lock to ensure there aren't any
+	// other concurrent processes attempting to lease the same UTXO.
+	var expiration time.Time
+	err = w.cfg.CoinSelectionLocker.WithCoinSelectLock(func() error {
+		expiration, err = w.cfg.Wallet.LeaseOutput(lockID, *op)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &LeaseOutputResponse{
+		Expiration: uint64(expiration.Unix()),
+	}, nil
+}
+
+// ReleaseOutput unlocks an output, allowing it to be available for coin
+// selection if it remains unspent. The ID should match the one used to
+// originally lock the output.
+func (w *WalletKit) ReleaseOutput(ctx context.Context,
+	req *ReleaseOutputRequest) (*ReleaseOutputResponse, error) {
+
+	if len(req.Id) != 32 {
+		return nil, errors.New("id must be 32 random bytes")
+	}
+	var lockID wtxmgr.LockID
+	copy(lockID[:], req.Id)
+
+	op, err := unmarshallOutPoint(req.Outpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// Acquire the global coin selection lock to maintain consistency as
+	// it's acquired when we initially leased the output.
+	err = w.cfg.CoinSelectionLocker.WithCoinSelectLock(func() error {
+		return w.cfg.Wallet.ReleaseOutput(lockID, *op)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &ReleaseOutputResponse{}, nil
 }
 
 // DeriveNextKey attempts to derive the *next* key within the key family
@@ -254,7 +435,12 @@ func (w *WalletKit) PublishTransaction(ctx context.Context,
 		return nil, err
 	}
 
-	err := w.cfg.Wallet.PublishTransaction(tx)
+	label, err := labels.ValidateAPI(req.Label)
+	if err != nil {
+		return nil, err
+	}
+
+	err = w.cfg.Wallet.PublishTransaction(tx, label)
 	if err != nil {
 		return nil, err
 	}
@@ -287,10 +473,15 @@ func (w *WalletKit) SendOutputs(ctx context.Context,
 		})
 	}
 
+	label, err := labels.ValidateAPI(req.Label)
+	if err != nil {
+		return nil, err
+	}
+
 	// Now that we have the outputs mapped, we can request that the wallet
 	// attempt to create this transaction.
 	tx, err := w.cfg.Wallet.SendOutputs(
-		outputsToCreate, lnwallet.SatPerKWeight(req.SatPerKw),
+		outputsToCreate, chainfee.SatPerKWeight(req.SatPerKw), label,
 	)
 	if err != nil {
 		return nil, err
@@ -330,4 +521,305 @@ func (w *WalletKit) EstimateFee(ctx context.Context,
 	return &EstimateFeeResponse{
 		SatPerKw: int64(satPerKw),
 	}, nil
+}
+
+// PendingSweeps returns lists of on-chain outputs that lnd is currently
+// attempting to sweep within its central batching engine. Outputs with similar
+// fee rates are batched together in order to sweep them within a single
+// transaction. The fee rate of each sweeping transaction is determined by
+// taking the average fee rate of all the outputs it's trying to sweep.
+func (w *WalletKit) PendingSweeps(ctx context.Context,
+	in *PendingSweepsRequest) (*PendingSweepsResponse, error) {
+
+	// Retrieve all of the outputs the UtxoSweeper is currently trying to
+	// sweep.
+	pendingInputs, err := w.cfg.Sweeper.PendingInputs()
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert them into their respective RPC format.
+	rpcPendingSweeps := make([]*PendingSweep, 0, len(pendingInputs))
+	for _, pendingInput := range pendingInputs {
+		var witnessType WitnessType
+		switch pendingInput.WitnessType {
+		case input.CommitmentTimeLock:
+			witnessType = WitnessType_COMMITMENT_TIME_LOCK
+		case input.CommitmentNoDelay:
+			witnessType = WitnessType_COMMITMENT_NO_DELAY
+		case input.CommitmentRevoke:
+			witnessType = WitnessType_COMMITMENT_REVOKE
+		case input.HtlcOfferedRevoke:
+			witnessType = WitnessType_HTLC_OFFERED_REVOKE
+		case input.HtlcAcceptedRevoke:
+			witnessType = WitnessType_HTLC_ACCEPTED_REVOKE
+		case input.HtlcOfferedTimeoutSecondLevel:
+			witnessType = WitnessType_HTLC_OFFERED_TIMEOUT_SECOND_LEVEL
+		case input.HtlcAcceptedSuccessSecondLevel:
+			witnessType = WitnessType_HTLC_ACCEPTED_SUCCESS_SECOND_LEVEL
+		case input.HtlcOfferedRemoteTimeout:
+			witnessType = WitnessType_HTLC_OFFERED_REMOTE_TIMEOUT
+		case input.HtlcAcceptedRemoteSuccess:
+			witnessType = WitnessType_HTLC_ACCEPTED_REMOTE_SUCCESS
+		case input.HtlcSecondLevelRevoke:
+			witnessType = WitnessType_HTLC_SECOND_LEVEL_REVOKE
+		case input.WitnessKeyHash:
+			witnessType = WitnessType_WITNESS_KEY_HASH
+		case input.NestedWitnessKeyHash:
+			witnessType = WitnessType_NESTED_WITNESS_KEY_HASH
+		case input.CommitmentAnchor:
+			witnessType = WitnessType_COMMITMENT_ANCHOR
+		default:
+			log.Warnf("Unhandled witness type %v for input %v",
+				pendingInput.WitnessType, pendingInput.OutPoint)
+		}
+
+		op := &lnrpc.OutPoint{
+			TxidBytes:   pendingInput.OutPoint.Hash[:],
+			OutputIndex: pendingInput.OutPoint.Index,
+		}
+		amountSat := uint32(pendingInput.Amount)
+		satPerByte := uint32(pendingInput.LastFeeRate.FeePerKVByte() / 1000)
+		broadcastAttempts := uint32(pendingInput.BroadcastAttempts)
+		nextBroadcastHeight := uint32(pendingInput.NextBroadcastHeight)
+
+		requestedFee := pendingInput.Params.Fee
+		requestedFeeRate := uint32(requestedFee.FeeRate.FeePerKVByte() / 1000)
+
+		rpcPendingSweeps = append(rpcPendingSweeps, &PendingSweep{
+			Outpoint:            op,
+			WitnessType:         witnessType,
+			AmountSat:           amountSat,
+			SatPerByte:          satPerByte,
+			BroadcastAttempts:   broadcastAttempts,
+			NextBroadcastHeight: nextBroadcastHeight,
+			RequestedSatPerByte: requestedFeeRate,
+			RequestedConfTarget: requestedFee.ConfTarget,
+			Force:               pendingInput.Params.Force,
+		})
+	}
+
+	return &PendingSweepsResponse{
+		PendingSweeps: rpcPendingSweeps,
+	}, nil
+}
+
+// unmarshallOutPoint converts an outpoint from its lnrpc type to its canonical
+// type.
+func unmarshallOutPoint(op *lnrpc.OutPoint) (*wire.OutPoint, error) {
+	if op == nil {
+		return nil, fmt.Errorf("empty outpoint provided")
+	}
+
+	var hash chainhash.Hash
+	switch {
+	case len(op.TxidBytes) == 0 && len(op.TxidStr) == 0:
+		fallthrough
+
+	case len(op.TxidBytes) != 0 && len(op.TxidStr) != 0:
+		return nil, fmt.Errorf("either TxidBytes or TxidStr must be " +
+			"specified, but not both")
+
+	// The hash was provided as raw bytes.
+	case len(op.TxidBytes) != 0:
+		copy(hash[:], op.TxidBytes)
+
+	// The hash was provided as a hex-encoded string.
+	case len(op.TxidStr) != 0:
+		h, err := chainhash.NewHashFromStr(op.TxidStr)
+		if err != nil {
+			return nil, err
+		}
+		hash = *h
+	}
+
+	return &wire.OutPoint{
+		Hash:  hash,
+		Index: op.OutputIndex,
+	}, nil
+}
+
+// BumpFee allows bumping the fee rate of an arbitrary input. A fee preference
+// can be expressed either as a specific fee rate or a delta of blocks in which
+// the output should be swept on-chain within. If a fee preference is not
+// explicitly specified, then an error is returned. The status of the input
+// sweep can be checked through the PendingSweeps RPC.
+func (w *WalletKit) BumpFee(ctx context.Context,
+	in *BumpFeeRequest) (*BumpFeeResponse, error) {
+
+	// Parse the outpoint from the request.
+	op, err := unmarshallOutPoint(in.Outpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// Construct the request's fee preference.
+	satPerKw := chainfee.SatPerKVByte(in.SatPerByte * 1000).FeePerKWeight()
+	feePreference := sweep.FeePreference{
+		ConfTarget: uint32(in.TargetConf),
+		FeeRate:    satPerKw,
+	}
+
+	// We'll attempt to bump the fee of the input through the UtxoSweeper.
+	// If it is currently attempting to sweep the input, then it'll simply
+	// bump its fee, which will result in a replacement transaction (RBF)
+	// being broadcast. If it is not aware of the input however,
+	// lnwallet.ErrNotMine is returned.
+	params := sweep.ParamsUpdate{
+		Fee:   feePreference,
+		Force: in.Force,
+	}
+
+	_, err = w.cfg.Sweeper.UpdateParams(*op, params)
+	switch err {
+	case nil:
+		return &BumpFeeResponse{}, nil
+	case lnwallet.ErrNotMine:
+		break
+	default:
+		return nil, err
+	}
+
+	log.Debugf("Attempting to CPFP outpoint %s", op)
+
+	// Since we're unable to perform a bump through RBF, we'll assume the
+	// user is attempting to bump an unconfirmed transaction's fee rate by
+	// sweeping an output within it under control of the wallet with a
+	// higher fee rate, essentially performing a Child-Pays-For-Parent
+	// (CPFP).
+	//
+	// We'll gather all of the information required by the UtxoSweeper in
+	// order to sweep the output.
+	utxo, err := w.cfg.Wallet.FetchInputInfo(op)
+	if err != nil {
+		return nil, err
+	}
+
+	// We're only able to bump the fee of unconfirmed transactions.
+	if utxo.Confirmations > 0 {
+		return nil, errors.New("unable to bump fee of a confirmed " +
+			"transaction")
+	}
+
+	var witnessType input.WitnessType
+	switch utxo.AddressType {
+	case lnwallet.WitnessPubKey:
+		witnessType = input.WitnessKeyHash
+	case lnwallet.NestedWitnessPubKey:
+		witnessType = input.NestedWitnessKeyHash
+	default:
+		return nil, fmt.Errorf("unknown input witness %v", op)
+	}
+
+	signDesc := &input.SignDescriptor{
+		Output: &wire.TxOut{
+			PkScript: utxo.PkScript,
+			Value:    int64(utxo.Value),
+		},
+		HashType: txscript.SigHashAll,
+	}
+
+	// We'll use the current height as the height hint since we're dealing
+	// with an unconfirmed transaction.
+	_, currentHeight, err := w.cfg.Chain.GetBestBlock()
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve current height: %v",
+			err)
+	}
+
+	input := input.NewBaseInput(op, witnessType, signDesc, uint32(currentHeight))
+	if _, err = w.cfg.Sweeper.SweepInput(input, sweep.Params{Fee: feePreference}); err != nil {
+		return nil, err
+	}
+
+	return &BumpFeeResponse{}, nil
+}
+
+// ListSweeps returns a list of the sweeps that our node has published.
+func (w *WalletKit) ListSweeps(ctx context.Context,
+	in *ListSweepsRequest) (*ListSweepsResponse, error) {
+
+	sweeps, err := w.cfg.Sweeper.ListSweeps()
+	if err != nil {
+		return nil, err
+	}
+
+	sweepTxns := make(map[string]bool)
+
+	txids := make([]string, len(sweeps))
+	for i, sweep := range sweeps {
+		sweepTxns[sweep.String()] = true
+		txids[i] = sweep.String()
+	}
+
+	// If the caller does not want verbose output, just return the set of
+	// sweep txids.
+	if !in.Verbose {
+		txidResp := &ListSweepsResponse_TransactionIDs{
+			TransactionIds: txids,
+		}
+
+		return &ListSweepsResponse{
+			Sweeps: &ListSweepsResponse_TransactionIds{
+				TransactionIds: txidResp,
+			},
+		}, nil
+	}
+
+	// If the caller does want full transaction lookups, query our wallet
+	// for all transactions, including unconfirmed transactions.
+	transactions, err := w.cfg.Wallet.ListTransactionDetails(
+		0, btcwallet.UnconfirmedHeight,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var sweepTxDetails []*lnwallet.TransactionDetail
+	for _, tx := range transactions {
+		_, ok := sweepTxns[tx.Hash.String()]
+		if !ok {
+			continue
+		}
+
+		sweepTxDetails = append(sweepTxDetails, tx)
+	}
+
+	// Fail if we have not retrieved all of our sweep transactions from the
+	// wallet.
+	if len(sweepTxDetails) != len(txids) {
+		return nil, fmt.Errorf("not all sweeps found by list "+
+			"transactions: %v, %v", len(sweepTxDetails), len(txids))
+	}
+
+	return &ListSweepsResponse{
+		Sweeps: &ListSweepsResponse_TransactionDetails{
+			TransactionDetails: lnrpc.RPCTransactionDetails(transactions),
+		},
+	}, nil
+}
+
+// LabelTransaction adds a label to a transaction.
+func (w *WalletKit) LabelTransaction(ctx context.Context,
+	req *LabelTransactionRequest) (*LabelTransactionResponse, error) {
+
+	// Check that the label provided in non-zero.
+	if len(req.Label) == 0 {
+		return nil, ErrZeroLabel
+	}
+
+	// Validate the length of the non-zero label. We do not need to use the
+	// label returned here, because the original is non-zero so will not
+	// be replaced.
+	if _, err := labels.ValidateAPI(req.Label); err != nil {
+		return nil, err
+	}
+
+	hash, err := chainhash.NewHash(req.Txid)
+	if err != nil {
+		return nil, err
+	}
+
+	err = w.cfg.Wallet.LabelTransaction(*hash, req.Label, req.Overwrite)
+	return &LabelTransactionResponse{}, err
 }

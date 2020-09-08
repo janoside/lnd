@@ -11,10 +11,11 @@ import (
 	"google.golang.org/grpc"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 
-	"github.com/btcsuite/btcutil"
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/macaroons"
 )
 
 const (
@@ -69,9 +70,6 @@ var (
 // RPC server allows external callers to access the status of the invoices
 // currently active within lnd, as well as configuring it at runtime.
 type Server struct {
-	started  int32 // To be used atomically.
-	shutdown int32 // To be used atomically.
-
 	quit chan struct{}
 
 	cfg *Config
@@ -102,8 +100,8 @@ func New(cfg *Config) (*Server, lnrpc.MacaroonPerms, error) {
 		// At this point, we know that the invoices macaroon doesn't
 		// yet, exist, so we need to create it with the help of the
 		// main macaroon service.
-		invoicesMac, err := cfg.MacService.Oven.NewMacaroon(
-			context.Background(), bakery.LatestVersion, nil,
+		invoicesMac, err := cfg.MacService.NewMacaroon(
+			context.Background(), macaroons.DefaultRootKeyID,
 			macaroonOps...,
 		)
 		if err != nil {
@@ -168,9 +166,31 @@ func (s *Server) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	return nil
 }
 
-// SubscribeInvoices returns a uni-directional stream (server -> client) for
-// notifying the client of invoice state changes.
-func (s *Server) SubscribeSingleInvoice(req *lnrpc.PaymentHash,
+// RegisterWithRestServer will be called by the root REST mux to direct a sub
+// RPC server to register itself with the main REST mux server. Until this is
+// called, each sub-server won't be able to have requests routed towards it.
+//
+// NOTE: This is part of the lnrpc.SubServer interface.
+func (s *Server) RegisterWithRestServer(ctx context.Context,
+	mux *runtime.ServeMux, dest string, opts []grpc.DialOption) error {
+
+	// We make sure that we register it with the main REST server to ensure
+	// all our methods are routed properly.
+	err := RegisterInvoicesHandlerFromEndpoint(ctx, mux, dest, opts)
+	if err != nil {
+		log.Errorf("Could not register Invoices REST server "+
+			"with root REST server: %v", err)
+		return err
+	}
+
+	log.Debugf("Invoices REST server successfully registered with " +
+		"root REST server")
+	return nil
+}
+
+// SubscribeSingleInvoice returns a uni-directional stream (server -> client)
+// for notifying the client of state changes for a specified invoice.
+func (s *Server) SubscribeSingleInvoice(req *SubscribeSingleInvoiceRequest,
 	updateStream Invoices_SubscribeSingleInvoiceServer) error {
 
 	hash, err := lntypes.MakeHash(req.RHash)
@@ -178,7 +198,10 @@ func (s *Server) SubscribeSingleInvoice(req *lnrpc.PaymentHash,
 		return err
 	}
 
-	invoiceClient := s.cfg.InvoiceRegistry.SubscribeSingleInvoice(hash)
+	invoiceClient, err := s.cfg.InvoiceRegistry.SubscribeSingleInvoice(hash)
+	if err != nil {
+		return err
+	}
 	defer invoiceClient.Cancel()
 
 	for {
@@ -247,13 +270,13 @@ func (s *Server) AddHoldInvoice(ctx context.Context,
 	invoice *AddHoldInvoiceRequest) (*AddHoldInvoiceResp, error) {
 
 	addInvoiceCfg := &AddInvoiceConfig{
-		AddInvoice:        s.cfg.InvoiceRegistry.AddInvoice,
-		IsChannelActive:   s.cfg.IsChannelActive,
-		ChainParams:       s.cfg.ChainParams,
-		NodeSigner:        s.cfg.NodeSigner,
-		MaxPaymentMSat:    s.cfg.MaxPaymentMSat,
-		DefaultCLTVExpiry: s.cfg.DefaultCLTVExpiry,
-		ChanDB:            s.cfg.ChanDB,
+		AddInvoice:         s.cfg.InvoiceRegistry.AddInvoice,
+		IsChannelActive:    s.cfg.IsChannelActive,
+		ChainParams:        s.cfg.ChainParams,
+		NodeSigner:         s.cfg.NodeSigner,
+		DefaultCLTVExpiry:  s.cfg.DefaultCLTVExpiry,
+		ChanDB:             s.cfg.ChanDB,
+		GenInvoiceFeatures: s.cfg.GenInvoiceFeatures,
 	}
 
 	hash, err := lntypes.MakeHash(invoice.Hash)
@@ -261,15 +284,22 @@ func (s *Server) AddHoldInvoice(ctx context.Context,
 		return nil, err
 	}
 
+	value, err := lnrpc.UnmarshallAmt(invoice.Value, invoice.ValueMsat)
+	if err != nil {
+		return nil, err
+	}
+
 	addInvoiceData := &AddInvoiceData{
 		Memo:            invoice.Memo,
 		Hash:            &hash,
-		Value:           btcutil.Amount(invoice.Value),
+		Value:           value,
 		DescriptionHash: invoice.DescriptionHash,
 		Expiry:          invoice.Expiry,
 		FallbackAddr:    invoice.FallbackAddr,
 		CltvExpiry:      invoice.CltvExpiry,
 		Private:         invoice.Private,
+		HodlInvoice:     true,
+		Preimage:        nil,
 	}
 
 	_, dbInvoice, err := AddInvoice(ctx, addInvoiceCfg, addInvoiceData)

@@ -1,6 +1,8 @@
 package btcwallet
 
 import (
+	"fmt"
+
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
@@ -21,22 +23,8 @@ import (
 // of ErrNotMine should be returned instead.
 //
 // This is a part of the WalletController interface.
-func (b *BtcWallet) FetchInputInfo(prevOut *wire.OutPoint) (*wire.TxOut, error) {
-	var (
-		err    error
-		output *wire.TxOut
-	)
-
-	// First check to see if the output is already within the utxo cache.
-	// If so we can return directly saving a disk access.
-	b.cacheMtx.RLock()
-	if output, ok := b.utxoCache[*prevOut]; ok {
-		b.cacheMtx.RUnlock()
-		return output, nil
-	}
-	b.cacheMtx.RUnlock()
-
-	// Otherwise, we manually look up the output within the tx store.
+func (b *BtcWallet) FetchInputInfo(prevOut *wire.OutPoint) (*lnwallet.Utxo, error) {
+	// We manually look up the output within the tx store.
 	txid := &prevOut.Hash
 	txDetail, err := base.UnstableAPI(b.wallet).TxDetails(txid)
 	if err != nil {
@@ -49,16 +37,45 @@ func (b *BtcWallet) FetchInputInfo(prevOut *wire.OutPoint) (*wire.TxOut, error) 
 	// we actually have control of this output. We do this because the check
 	// above only guarantees that the transaction is somehow relevant to us,
 	// like in the event of us being the sender of the transaction.
-	output = txDetail.TxRecord.MsgTx.TxOut[prevOut.Index]
-	if _, err := b.fetchOutputAddr(output.PkScript); err != nil {
+	numOutputs := uint32(len(txDetail.TxRecord.MsgTx.TxOut))
+	if prevOut.Index >= numOutputs {
+		return nil, fmt.Errorf("invalid output index %v for "+
+			"transaction with %v outputs", prevOut.Index, numOutputs)
+	}
+	pkScript := txDetail.TxRecord.MsgTx.TxOut[prevOut.Index].PkScript
+	if _, err := b.fetchOutputAddr(pkScript); err != nil {
 		return nil, err
 	}
 
-	b.cacheMtx.Lock()
-	b.utxoCache[*prevOut] = output
-	b.cacheMtx.Unlock()
+	// Then, we'll populate all of the information required by the struct.
+	addressType := lnwallet.UnknownAddressType
+	switch {
+	case txscript.IsPayToWitnessPubKeyHash(pkScript):
+		addressType = lnwallet.WitnessPubKey
+	case txscript.IsPayToScriptHash(pkScript):
+		addressType = lnwallet.NestedWitnessPubKey
+	}
 
-	return output, nil
+	// Determine the number of confirmations the output currently has.
+	_, currentHeight, err := b.GetBestBlock()
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve current height: %v",
+			err)
+	}
+	confs := int64(0)
+	if txDetail.Block.Height != -1 {
+		confs = int64(currentHeight - txDetail.Block.Height)
+	}
+
+	return &lnwallet.Utxo{
+		AddressType: addressType,
+		Value: btcutil.Amount(
+			txDetail.TxRecord.MsgTx.TxOut[prevOut.Index].Value,
+		),
+		PkScript:      pkScript,
+		Confirmations: confs,
+		OutPoint:      *prevOut,
+	}, nil
 }
 
 // fetchOutputAddr attempts to fetch the managed address corresponding to the
@@ -83,42 +100,79 @@ func (b *BtcWallet) fetchOutputAddr(script []byte) (waddrmgr.ManagedAddress, err
 	return nil, lnwallet.ErrNotMine
 }
 
+// deriveFromKeyLoc attempts to derive a private key using a fully specified
+// KeyLocator.
+func deriveFromKeyLoc(scopedMgr *waddrmgr.ScopedKeyManager,
+	addrmgrNs walletdb.ReadWriteBucket,
+	keyLoc keychain.KeyLocator) (*btcec.PrivateKey, error) {
+
+	path := waddrmgr.DerivationPath{
+		Account: uint32(keyLoc.Family),
+		Branch:  0,
+		Index:   uint32(keyLoc.Index),
+	}
+	addr, err := scopedMgr.DeriveFromKeyPath(addrmgrNs, path)
+	if err != nil {
+		return nil, err
+	}
+
+	return addr.(waddrmgr.ManagedPubKeyAddress).PrivKey()
+}
+
+// deriveKeyByLocator attempts to derive a key stored in the wallet given a
+// valid key locator.
+func (b *BtcWallet) deriveKeyByLocator(keyLoc keychain.KeyLocator) (*btcec.PrivateKey, error) {
+	// We'll assume the special lightning key scope in this case.
+	scopedMgr, err := b.wallet.Manager.FetchScopedKeyManager(
+		b.chainKeyScope,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var key *btcec.PrivateKey
+	err = walletdb.Update(b.db, func(tx walletdb.ReadWriteTx) error {
+		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		key, err = deriveFromKeyLoc(scopedMgr, addrmgrNs, keyLoc)
+		if waddrmgr.IsError(err, waddrmgr.ErrAccountNotFound) {
+			// If we've reached this point, then the account
+			// doesn't yet exist, so we'll create it now to ensure
+			// we can sign.
+			acctErr := scopedMgr.NewRawAccount(
+				addrmgrNs, uint32(keyLoc.Family),
+			)
+			if acctErr != nil {
+				return acctErr
+			}
+
+			// Now that we know the account exists, we'll attempt
+			// to re-derive the private key.
+			key, err = deriveFromKeyLoc(
+				scopedMgr, addrmgrNs, keyLoc,
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return key, nil
+}
+
 // fetchPrivKey attempts to retrieve the raw private key corresponding to the
 // passed public key if populated, or the key descriptor path (if non-empty).
 func (b *BtcWallet) fetchPrivKey(keyDesc *keychain.KeyDescriptor) (*btcec.PrivateKey, error) {
 	// If the key locator within the descriptor *isn't* empty, then we can
 	// directly derive the keys raw.
-	if !keyDesc.KeyLocator.IsEmpty() {
-		// We'll assume the special lightning key scope in this case.
-		scopedMgr, err := b.wallet.Manager.FetchScopedKeyManager(
-			b.chainKeyScope,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		var key *btcec.PrivateKey
-		err = walletdb.View(b.db, func(tx walletdb.ReadTx) error {
-			addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-
-			path := waddrmgr.DerivationPath{
-				Account: uint32(keyDesc.Family),
-				Branch:  0,
-				Index:   uint32(keyDesc.Index),
-			}
-			addr, err := scopedMgr.DeriveFromKeyPath(addrmgrNs, path)
-			if err != nil {
-				return err
-			}
-
-			key, err = addr.(waddrmgr.ManagedPubKeyAddress).PrivKey()
-			return err
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		return key, nil
+	emptyLocator := keyDesc.KeyLocator.IsEmpty()
+	if !emptyLocator {
+		return b.deriveKeyByLocator(keyDesc.KeyLocator)
 	}
 
 	hash160 := btcutil.Hash160(keyDesc.PubKey.SerializeCompressed())
@@ -127,7 +181,24 @@ func (b *BtcWallet) fetchPrivKey(keyDesc *keychain.KeyDescriptor) (*btcec.Privat
 		return nil, err
 	}
 
-	return b.wallet.PrivKeyForAddress(addr)
+	// Otherwise, we'll attempt to derive the key based on the address.
+	// This will only work if we've already derived this address in the
+	// past, since the wallet relies on a mapping of addr -> key.
+	key, err := b.wallet.PrivKeyForAddress(addr)
+	switch {
+	// If we didn't find this key in the wallet, then there's a chance that
+	// this is actually an "empty" key locator. The legacy KeyLocator
+	// format failed to properly distinguish an empty key locator from the
+	// very first in the index (0, 0).IsEmpty() == true.
+	case waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound) && emptyLocator:
+		return b.deriveKeyByLocator(keyDesc.KeyLocator)
+
+	case err != nil:
+		return nil, err
+
+	default:
+		return key, nil
+	}
 }
 
 // maybeTweakPrivKey examines the single and double tweak parameters on the
@@ -159,7 +230,7 @@ func maybeTweakPrivKey(signDesc *input.SignDescriptor,
 //
 // This is a part of the WalletController interface.
 func (b *BtcWallet) SignOutputRaw(tx *wire.MsgTx,
-	signDesc *input.SignDescriptor) ([]byte, error) {
+	signDesc *input.SignDescriptor) (input.Signature, error) {
 
 	witnessScript := signDesc.WitnessScript
 
@@ -190,7 +261,7 @@ func (b *BtcWallet) SignOutputRaw(tx *wire.MsgTx,
 	}
 
 	// Chop off the sighash flag at the end of the signature.
-	return sig[:len(sig)-1], nil
+	return btcec.ParseDERSignature(sig[:len(sig)-1], btcec.S256())
 }
 
 // ComputeInputScript generates a complete InputScript for the passed
@@ -292,7 +363,7 @@ var _ input.Signer = (*BtcWallet)(nil)
 //
 // NOTE: This is a part of the MessageSigner interface.
 func (b *BtcWallet) SignMessage(pubKey *btcec.PublicKey,
-	msg []byte) (*btcec.Signature, error) {
+	msg []byte) (input.Signature, error) {
 
 	// First attempt to fetch the private key which corresponds to the
 	// specified public key.

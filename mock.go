@@ -1,9 +1,11 @@
-package main
+package lnd
 
 import (
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg"
@@ -12,12 +14,17 @@ import (
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
-	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+)
+
+var (
+	coinPkScript, _ = hex.DecodeString("001431df1bde03c074d0cf21ea2529427e1499b8f1de")
 )
 
 // The block height returned by the mock BlockChainIO's GetBestBlock.
@@ -28,7 +35,7 @@ type mockSigner struct {
 }
 
 func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx,
-	signDesc *input.SignDescriptor) ([]byte, error) {
+	signDesc *input.SignDescriptor) (input.Signature, error) {
 	amt := signDesc.Output.Value
 	witnessScript := signDesc.WitnessScript
 	privKey := m.key
@@ -53,7 +60,7 @@ func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx,
 		return nil, err
 	}
 
-	return sig[:len(sig)-1], nil
+	return btcec.ParseDERSignature(sig[:len(sig)-1], btcec.S256())
 }
 
 func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx,
@@ -105,6 +112,10 @@ func (m *mockNotfier) RegisterBlockEpochNtfn(
 
 func (m *mockNotfier) Start() error {
 	return nil
+}
+
+func (m *mockNotfier) Started() bool {
+	return true
 }
 
 func (m *mockNotfier) Stop() error {
@@ -205,12 +216,14 @@ type mockChainIO struct {
 	bestHeight int32
 }
 
+var _ lnwallet.BlockChainIO = (*mockChainIO)(nil)
+
 func (m *mockChainIO) GetBestBlock() (*chainhash.Hash, int32, error) {
-	return activeNetParams.GenesisHash, m.bestHeight, nil
+	return chaincfg.TestNet3Params.GenesisHash, m.bestHeight, nil
 }
 
 func (*mockChainIO) GetUtxo(op *wire.OutPoint, _ []byte,
-	heightHint uint32) (*wire.TxOut, error) {
+	heightHint uint32, _ <-chan struct{}) (*wire.TxOut, error) {
 	return nil, nil
 }
 
@@ -226,9 +239,9 @@ func (*mockChainIO) GetBlock(blockHash *chainhash.Hash) (*wire.MsgBlock, error) 
 // interaction with the bitcoin network.
 type mockWalletController struct {
 	rootKey               *btcec.PrivateKey
-	prevAddres            btcutil.Address
 	publishedTransactions chan *wire.MsgTx
 	index                 uint32
+	utxos                 []*lnwallet.Utxo
 }
 
 // BackEnd returns "mock" to signify a mock wallet controller.
@@ -239,12 +252,15 @@ func (*mockWalletController) BackEnd() string {
 // FetchInputInfo will be called to get info about the inputs to the funding
 // transaction.
 func (*mockWalletController) FetchInputInfo(
-	prevOut *wire.OutPoint) (*wire.TxOut, error) {
-	txOut := &wire.TxOut{
-		Value:    int64(10 * btcutil.SatoshiPerBitcoin),
-		PkScript: []byte("dummy"),
+	prevOut *wire.OutPoint) (*lnwallet.Utxo, error) {
+	utxo := &lnwallet.Utxo{
+		AddressType:   lnwallet.WitnessPubKey,
+		Value:         10 * btcutil.SatoshiPerBitcoin,
+		PkScript:      []byte("dummy"),
+		Confirmations: 1,
+		OutPoint:      *prevOut,
 	}
-	return txOut, nil
+	return utxo, nil
 }
 func (*mockWalletController) ConfirmedBalance(confs int32) (btcutil.Amount, error) {
 	return 0, nil
@@ -267,13 +283,13 @@ func (*mockWalletController) IsOurAddress(a btcutil.Address) bool {
 }
 
 func (*mockWalletController) SendOutputs(outputs []*wire.TxOut,
-	_ lnwallet.SatPerKWeight) (*wire.MsgTx, error) {
+	_ chainfee.SatPerKWeight, _ string) (*wire.MsgTx, error) {
 
 	return nil, nil
 }
 
 func (*mockWalletController) CreateSimpleTx(outputs []*wire.TxOut,
-	_ lnwallet.SatPerKWeight, _ bool) (*txauthor.AuthoredTx, error) {
+	_ chainfee.SatPerKWeight, _ bool) (*txauthor.AuthoredTx, error) {
 
 	return nil, nil
 }
@@ -282,10 +298,17 @@ func (*mockWalletController) CreateSimpleTx(outputs []*wire.TxOut,
 // need one unspent for the funding transaction.
 func (m *mockWalletController) ListUnspentWitness(minconfirms,
 	maxconfirms int32) ([]*lnwallet.Utxo, error) {
+
+	// If the mock already has a list of utxos, return it.
+	if m.utxos != nil {
+		return m.utxos, nil
+	}
+
+	// Otherwise create one to return.
 	utxo := &lnwallet.Utxo{
 		AddressType: lnwallet.WitnessPubKey,
 		Value:       btcutil.Amount(10 * btcutil.SatoshiPerBitcoin),
-		PkScript:    make([]byte, 22),
+		PkScript:    coinPkScript,
 		OutPoint: wire.OutPoint{
 			Hash:  chainhash.Hash{},
 			Index: m.index,
@@ -296,20 +319,38 @@ func (m *mockWalletController) ListUnspentWitness(minconfirms,
 	ret = append(ret, utxo)
 	return ret, nil
 }
-func (*mockWalletController) ListTransactionDetails() ([]*lnwallet.TransactionDetail, error) {
+func (*mockWalletController) ListTransactionDetails(_, _ int32) ([]*lnwallet.TransactionDetail, error) {
 	return nil, nil
 }
 func (*mockWalletController) LockOutpoint(o wire.OutPoint)   {}
 func (*mockWalletController) UnlockOutpoint(o wire.OutPoint) {}
-func (m *mockWalletController) PublishTransaction(tx *wire.MsgTx) error {
+
+func (*mockWalletController) LeaseOutput(wtxmgr.LockID, wire.OutPoint) (time.Time, error) {
+	return time.Now(), nil
+}
+func (*mockWalletController) ReleaseOutput(wtxmgr.LockID, wire.OutPoint) error {
+	return nil
+}
+
+func (m *mockWalletController) PublishTransaction(tx *wire.MsgTx, _ string) error {
 	m.publishedTransactions <- tx
 	return nil
 }
+
+func (m *mockWalletController) LabelTransaction(_ chainhash.Hash, _ string,
+	_ bool) error {
+
+	return nil
+}
+
 func (*mockWalletController) SubscribeTransactions() (lnwallet.TransactionSubscription, error) {
 	return nil, nil
 }
 func (*mockWalletController) IsSynced() (bool, int64, error) {
 	return true, int64(0), nil
+}
+func (*mockWalletController) GetRecoveryInfo() (bool, float64, error) {
+	return true, float64(1), nil
 }
 func (*mockWalletController) Start() error {
 	return nil
@@ -338,37 +379,22 @@ func (m *mockSecretKeyRing) DerivePrivKey(keyDesc keychain.KeyDescriptor) (*btce
 	return m.rootKey, nil
 }
 
-func (m *mockSecretKeyRing) ScalarMult(keyDesc keychain.KeyDescriptor,
-	pubKey *btcec.PublicKey) ([]byte, error) {
-	return nil, nil
+func (m *mockSecretKeyRing) ECDH(_ keychain.KeyDescriptor,
+	pubKey *btcec.PublicKey) ([32]byte, error) {
+
+	return [32]byte{}, nil
 }
 
-type mockPreimageCache struct {
-	sync.Mutex
-	preimageMap map[lntypes.Hash]lntypes.Preimage
+func (m *mockSecretKeyRing) SignDigest(_ keychain.KeyDescriptor,
+	digest [32]byte) (*btcec.Signature, error) {
+
+	return m.rootKey.Sign(digest[:])
 }
 
-func newMockPreimageCache() *mockPreimageCache {
-	return &mockPreimageCache{
-		preimageMap: make(map[lntypes.Hash]lntypes.Preimage),
-	}
+func (m *mockSecretKeyRing) SignDigestCompact(_ keychain.KeyDescriptor,
+	digest [32]byte) ([]byte, error) {
+
+	return btcec.SignCompact(btcec.S256(), m.rootKey, digest[:], true)
 }
 
-func (m *mockPreimageCache) LookupPreimage(hash lntypes.Hash) (lntypes.Preimage, bool) {
-	m.Lock()
-	defer m.Unlock()
-
-	p, ok := m.preimageMap[hash]
-	return p, ok
-}
-
-func (m *mockPreimageCache) AddPreimages(preimages ...lntypes.Preimage) error {
-	m.Lock()
-	defer m.Unlock()
-
-	for _, preimage := range preimages {
-		m.preimageMap[preimage.Hash()] = preimage
-	}
-
-	return nil
-}
+var _ keychain.SecretKeyRing = (*mockSecretKeyRing)(nil)

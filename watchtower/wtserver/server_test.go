@@ -1,5 +1,3 @@
-// +build dev
-
 package wtserver_test
 
 import (
@@ -29,6 +27,8 @@ var (
 	addrScript, _ = txscript.PayToAddrScript(addr)
 
 	testnetChainHash = *chaincfg.TestNet3Params.GenesisHash
+
+	testBlob = make([]byte, blob.Size(blob.TypeAltruistCommit))
 )
 
 // randPubKey generates a new secp keypair, and returns the public key.
@@ -51,7 +51,7 @@ func initServer(t *testing.T, db wtserver.DB,
 	t.Helper()
 
 	if db == nil {
-		db = wtdb.NewMockDB()
+		db = wtmock.NewTowerDB()
 	}
 
 	s, err := wtserver.New(&wtserver.Config{
@@ -152,33 +152,80 @@ func TestServerOnlyAcceptOnePeer(t *testing.T) {
 }
 
 type createSessionTestCase struct {
-	name        string
-	initMsg     *wtwire.Init
-	createMsg   *wtwire.CreateSession
-	expReply    *wtwire.CreateSessionReply
-	expDupReply *wtwire.CreateSessionReply
+	name            string
+	initMsg         *wtwire.Init
+	createMsg       *wtwire.CreateSession
+	expReply        *wtwire.CreateSessionReply
+	expDupReply     *wtwire.CreateSessionReply
+	sendStateUpdate bool
 }
 
 var createSessionTests = []createSessionTestCase{
 	{
-		name: "reject duplicate session create",
+		name: "duplicate session create",
 		initMsg: wtwire.NewInitMessage(
 			lnwire.NewRawFeatureVector(),
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   1000,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
+		},
+		expReply: &wtwire.CreateSessionReply{
+			Code: wtwire.CodeOK,
+			Data: []byte{},
+		},
+		expDupReply: &wtwire.CreateSessionReply{
+			Code: wtwire.CodeOK,
+			Data: []byte{},
+		},
+	},
+	{
+		name: "duplicate session create after use",
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
+		createMsg: &wtwire.CreateSession{
+			BlobType:     blob.TypeAltruistCommit,
+			MaxUpdates:   1000,
+			RewardBase:   0,
+			RewardRate:   0,
+			SweepFeeRate: 10000,
+		},
+		expReply: &wtwire.CreateSessionReply{
+			Code: wtwire.CodeOK,
+			Data: []byte{},
+		},
+		expDupReply: &wtwire.CreateSessionReply{
+			Code:        wtwire.CreateSessionCodeAlreadyExists,
+			LastApplied: 1,
+			Data:        []byte{},
+		},
+		sendStateUpdate: true,
+	},
+	{
+		name: "duplicate session create reward",
+		initMsg: wtwire.NewInitMessage(
+			lnwire.NewRawFeatureVector(),
+			testnetChainHash,
+		),
+		createMsg: &wtwire.CreateSession{
+			BlobType:     blob.TypeRewardCommit,
+			MaxUpdates:   1000,
+			RewardBase:   0,
+			RewardRate:   0,
+			SweepFeeRate: 10000,
 		},
 		expReply: &wtwire.CreateSessionReply{
 			Code: wtwire.CodeOK,
 			Data: addrScript,
 		},
 		expDupReply: &wtwire.CreateSessionReply{
-			Code: wtwire.CreateSessionCodeAlreadyExists,
+			Code: wtwire.CodeOK,
 			Data: addrScript,
 		},
 	},
@@ -193,7 +240,7 @@ var createSessionTests = []createSessionTestCase{
 			MaxUpdates:   1000,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		expReply: &wtwire.CreateSessionReply{
 			Code: wtwire.CreateSessionCodeRejectBlobType,
@@ -251,6 +298,19 @@ func testServerCreateSession(t *testing.T, i int, test createSessionTestCase) {
 		return
 	}
 
+	if test.sendStateUpdate {
+		peer = wtmock.NewMockPeer(localPub, peerPub, nil, 0)
+		connect(t, s, peer, test.initMsg, timeoutDuration)
+		update := &wtwire.StateUpdate{
+			SeqNum:        1,
+			IsComplete:    1,
+			EncryptedBlob: testBlob,
+		}
+		sendMsg(t, update, peer, timeoutDuration)
+
+		assertConnClosed(t, peer, 2*timeoutDuration)
+	}
+
 	// Simulate a peer with the same session id connection to the server
 	// again.
 	peer = wtmock.NewMockPeer(localPub, peerPub, nil, 0)
@@ -266,8 +326,8 @@ func testServerCreateSession(t *testing.T, i int, test createSessionTestCase) {
 	// Ensure that the server's reply matches our expected response for a
 	// duplicate send.
 	if !reflect.DeepEqual(reply, test.expDupReply) {
-		t.Fatalf("[test %d] expected reply %v, got %d",
-			i, test.expReply, reply)
+		t.Fatalf("[test %d] expected reply %v, got %v",
+			i, test.expDupReply, reply)
 	}
 
 	// Finally, check that the server tore down the connection.
@@ -291,17 +351,17 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   3,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 1, LastApplied: 0},
-			{SeqNum: 2, LastApplied: 1},
-			{SeqNum: 3, LastApplied: 2},
-			{SeqNum: 3, LastApplied: 3},
+			{SeqNum: 1, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 2, LastApplied: 1, EncryptedBlob: testBlob},
+			{SeqNum: 3, LastApplied: 2, EncryptedBlob: testBlob},
+			{SeqNum: 3, LastApplied: 3, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{Code: wtwire.CodeOK, LastApplied: 1},
@@ -321,14 +381,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   4,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 2, LastApplied: 0},
+			{SeqNum: 2, LastApplied: 0, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{
@@ -345,16 +405,16 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   4,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 1, LastApplied: 0},
-			{SeqNum: 2, LastApplied: 0},
-			{SeqNum: 1, LastApplied: 0},
+			{SeqNum: 1, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 2, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 1, LastApplied: 0, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{Code: wtwire.CodeOK, LastApplied: 1},
@@ -373,17 +433,17 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   4,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 1, LastApplied: 0},
-			{SeqNum: 2, LastApplied: 1},
-			{SeqNum: 3, LastApplied: 2},
-			{SeqNum: 4, LastApplied: 1},
+			{SeqNum: 1, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 2, LastApplied: 1, EncryptedBlob: testBlob},
+			{SeqNum: 3, LastApplied: 2, EncryptedBlob: testBlob},
+			{SeqNum: 4, LastApplied: 1, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{Code: wtwire.CodeOK, LastApplied: 1},
@@ -401,18 +461,18 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   4,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 1, LastApplied: 0},
-			{SeqNum: 2, LastApplied: 1},
+			{SeqNum: 1, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 2, LastApplied: 1, EncryptedBlob: testBlob},
 			nil, // Wait for read timeout to drop conn, then reconnect.
-			{SeqNum: 3, LastApplied: 2},
-			{SeqNum: 4, LastApplied: 3},
+			{SeqNum: 3, LastApplied: 2, EncryptedBlob: testBlob},
+			{SeqNum: 4, LastApplied: 3, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{Code: wtwire.CodeOK, LastApplied: 1},
@@ -431,18 +491,18 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   4,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 1, LastApplied: 0},
-			{SeqNum: 2, LastApplied: 0},
+			{SeqNum: 1, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 2, LastApplied: 0, EncryptedBlob: testBlob},
 			nil, // Wait for read timeout to drop conn, then reconnect.
-			{SeqNum: 3, LastApplied: 0},
-			{SeqNum: 4, LastApplied: 3},
+			{SeqNum: 3, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 4, LastApplied: 3, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{Code: wtwire.CodeOK, LastApplied: 1},
@@ -461,19 +521,19 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   4,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 1, LastApplied: 0},
-			{SeqNum: 2, LastApplied: 0},
+			{SeqNum: 1, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 2, LastApplied: 0, EncryptedBlob: testBlob},
 			nil, // Wait for read timeout to drop conn, then reconnect.
-			{SeqNum: 2, LastApplied: 0},
-			{SeqNum: 3, LastApplied: 0},
-			{SeqNum: 4, LastApplied: 3},
+			{SeqNum: 2, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 3, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 4, LastApplied: 3, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{Code: wtwire.CodeOK, LastApplied: 1},
@@ -492,17 +552,17 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   3,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 1, LastApplied: 0},
-			{SeqNum: 2, LastApplied: 1},
-			{SeqNum: 3, LastApplied: 2},
-			{SeqNum: 4, LastApplied: 3},
+			{SeqNum: 1, LastApplied: 0, EncryptedBlob: testBlob},
+			{SeqNum: 2, LastApplied: 1, EncryptedBlob: testBlob},
+			{SeqNum: 3, LastApplied: 2, EncryptedBlob: testBlob},
+			{SeqNum: 4, LastApplied: 3, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{Code: wtwire.CodeOK, LastApplied: 1},
@@ -522,14 +582,14 @@ var stateUpdateTests = []stateUpdateTestCase{
 			testnetChainHash,
 		),
 		createMsg: &wtwire.CreateSession{
-			BlobType:     blob.TypeDefault,
+			BlobType:     blob.TypeAltruistCommit,
 			MaxUpdates:   3,
 			RewardBase:   0,
 			RewardRate:   0,
-			SweepFeeRate: 1,
+			SweepFeeRate: 10000,
 		},
 		updates: []*wtwire.StateUpdate{
-			{SeqNum: 0, LastApplied: 0},
+			{SeqNum: 0, LastApplied: 0, EncryptedBlob: testBlob},
 		},
 		replies: []*wtwire.StateUpdateReply{
 			{
@@ -626,7 +686,7 @@ func testServerStateUpdates(t *testing.T, test stateUpdateTestCase) {
 // checking that the proper error is returned when the session doesn't exist and
 // that a successful deletion does not disrupt other sessions.
 func TestServerDeleteSession(t *testing.T) {
-	db := wtdb.NewMockDB()
+	db := wtmock.NewTowerDB()
 
 	localPub := randPubKey(t)
 
@@ -659,11 +719,11 @@ func TestServerDeleteSession(t *testing.T) {
 	)
 
 	createSession := &wtwire.CreateSession{
-		BlobType:     blob.TypeDefault,
+		BlobType:     blob.TypeAltruistCommit,
 		MaxUpdates:   1000,
 		RewardBase:   0,
 		RewardRate:   0,
-		SweepFeeRate: 1,
+		SweepFeeRate: 10000,
 	}
 
 	const timeoutDuration = 100 * time.Millisecond
@@ -705,7 +765,7 @@ func TestServerDeleteSession(t *testing.T) {
 			send: createSession,
 			recv: &wtwire.CreateSessionReply{
 				Code: wtwire.CodeOK,
-				Data: addrScript,
+				Data: []byte{},
 			},
 			assert: func(t *testing.T) {
 				// Both peers should have sessions.

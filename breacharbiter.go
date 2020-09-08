@@ -1,4 +1,4 @@
-package main
+package lnd
 
 import (
 	"bytes"
@@ -7,21 +7,22 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
-	"github.com/coreos/bbolt"
 	"github.com/davecgh/go-spew/spew"
 
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/labels"
 	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 )
 
 var (
@@ -79,7 +80,7 @@ type BreachConfig struct {
 	// Estimator is used by the breach arbiter to determine an appropriate
 	// fee level when generating, signing, and broadcasting sweep
 	// transactions.
-	Estimator lnwallet.FeeEstimator
+	Estimator chainfee.Estimator
 
 	// GenSweepScript generates the receiving scripts for swept outputs.
 	GenSweepScript func() ([]byte, error)
@@ -90,7 +91,7 @@ type BreachConfig struct {
 
 	// PublishTransaction facilitates the process of broadcasting a
 	// transaction to the network.
-	PublishTransaction func(*wire.MsgTx) error
+	PublishTransaction func(*wire.MsgTx, string) error
 
 	// ContractBreaches is a channel where the breachArbiter will receive
 	// notifications in the event of a contract breach being observed. A
@@ -118,8 +119,8 @@ type BreachConfig struct {
 // counterparties.
 // TODO(roasbeef): closures in config for subsystem pointers to decouple?
 type breachArbiter struct {
-	started uint32 // To be used atomically.
-	stopped uint32 // To be used atomically.
+	started sync.Once
+	stopped sync.Once
 
 	cfg *BreachConfig
 
@@ -140,10 +141,14 @@ func newBreachArbiter(cfg *BreachConfig) *breachArbiter {
 // Start is an idempotent method that officially starts the breachArbiter along
 // with all other goroutines it needs to perform its functions.
 func (b *breachArbiter) Start() error {
-	if !atomic.CompareAndSwapUint32(&b.started, 0, 1) {
-		return nil
-	}
+	var err error
+	b.started.Do(func() {
+		err = b.start()
+	})
+	return err
+}
 
+func (b *breachArbiter) start() error {
 	brarLog.Tracef("Starting breach arbiter")
 
 	// Load all retributions currently persisted in the retribution store.
@@ -226,15 +231,12 @@ func (b *breachArbiter) Start() error {
 // graceful shutdown. This function will block until all goroutines spawned by
 // the breachArbiter have gracefully exited.
 func (b *breachArbiter) Stop() error {
-	if !atomic.CompareAndSwapUint32(&b.stopped, 0, 1) {
-		return nil
-	}
+	b.stopped.Do(func() {
+		brarLog.Infof("Breach arbiter shutting down")
 
-	brarLog.Infof("Breach arbiter shutting down")
-
-	close(b.quit)
-	b.wg.Wait()
-
+		close(b.quit)
+		b.wg.Wait()
+	})
 	return nil
 }
 
@@ -565,7 +567,8 @@ justiceTxBroadcast:
 
 	// We'll now attempt to broadcast the transaction which finalized the
 	// channel's retribution against the cheating counter party.
-	err = b.cfg.PublishTransaction(finalTx)
+	label := labels.MakeLabel(labels.LabelTypeJusticeTransaction, nil)
+	err = b.cfg.PublishTransaction(finalTx, label)
 	if err != nil {
 		brarLog.Errorf("Unable to broadcast justice tx: %v", err)
 
@@ -821,7 +824,7 @@ func (b *breachArbiter) handleBreachHandoff(breachEvent *ContractBreachEvent) {
 type breachedOutput struct {
 	amt         btcutil.Amount
 	outpoint    wire.OutPoint
-	witnessType input.WitnessType
+	witnessType input.StandardWitnessType
 	signDesc    input.SignDescriptor
 	confHeight  uint32
 
@@ -833,7 +836,7 @@ type breachedOutput struct {
 // makeBreachedOutput assembles a new breachedOutput that can be used by the
 // breach arbiter to construct a justice or sweep transaction.
 func makeBreachedOutput(outpoint *wire.OutPoint,
-	witnessType input.WitnessType,
+	witnessType input.StandardWitnessType,
 	secondLevelScript []byte,
 	signDescriptor *input.SignDescriptor,
 	confHeight uint32) breachedOutput {
@@ -883,9 +886,7 @@ func (bo *breachedOutput) CraftInputScript(signer input.Signer, txn *wire.MsgTx,
 
 	// First, we ensure that the witness generation function has been
 	// initialized for this breached output.
-	bo.witnessFunc = bo.witnessType.GenWitnessFunc(
-		signer, bo.SignDesc(),
-	)
+	bo.witnessFunc = bo.witnessType.WitnessGenerator(signer, bo.SignDesc())
 
 	// Now that we have ensured that the witness generation function has
 	// been initialized, we can proceed to execute it and generate the
@@ -897,6 +898,13 @@ func (bo *breachedOutput) CraftInputScript(signer input.Signer, txn *wire.MsgTx,
 // must be built on top of the confirmation height before the output can be
 // spent.
 func (bo *breachedOutput) BlocksToMaturity() uint32 {
+	// If the output is a to_remote output we can claim, and it's of the
+	// confirmed type, we must wait one block before claiming it.
+	if bo.witnessType == input.CommitmentToRemoteConfirmed {
+		return 1
+	}
+
+	// All other breached outputs have no CSV delay.
 	return 0
 }
 
@@ -944,17 +952,30 @@ func newRetributionInfo(chanPoint *wire.OutPoint,
 
 	// First, record the breach information for the local channel point if
 	// it is not considered dust, which is signaled by a non-nil sign
-	// descriptor. Here we use CommitmentNoDelay since this output belongs
-	// to us and has no time-based constraints on spending.
+	// descriptor. Here we use CommitmentNoDelay (or
+	// CommitmentNoDelayTweakless for newer commitments) since this output
+	// belongs to us and has no time-based constraints on spending.
 	if breachInfo.LocalOutputSignDesc != nil {
+		witnessType := input.CommitmentNoDelay
+		if breachInfo.LocalOutputSignDesc.SingleTweak == nil {
+			witnessType = input.CommitSpendNoDelayTweakless
+		}
+
+		// If the local delay is non-zero, it means this output is of
+		// the confirmed to_remote type.
+		if breachInfo.LocalDelay != 0 {
+			witnessType = input.CommitmentToRemoteConfirmed
+		}
+
 		localOutput := makeBreachedOutput(
 			&breachInfo.LocalOutpoint,
-			input.CommitmentNoDelay,
+			witnessType,
 			// No second level script as this is a commitment
 			// output.
 			nil,
 			breachInfo.LocalOutputSignDesc,
-			breachInfo.BreachHeight)
+			breachInfo.BreachHeight,
+		)
 
 		breachedOutputs = append(breachedOutputs, localOutput)
 	}
@@ -972,7 +993,8 @@ func newRetributionInfo(chanPoint *wire.OutPoint,
 			// output.
 			nil,
 			breachInfo.RemoteOutputSignDesc,
-			breachInfo.BreachHeight)
+			breachInfo.BreachHeight,
+		)
 
 		breachedOutputs = append(breachedOutputs, remoteOutput)
 	}
@@ -985,7 +1007,7 @@ func newRetributionInfo(chanPoint *wire.OutPoint,
 		// Using the breachedHtlc's incoming flag, determine the
 		// appropriate witness type that needs to be generated in order
 		// to sweep the HTLC output.
-		var htlcWitnessType input.WitnessType
+		var htlcWitnessType input.StandardWitnessType
 		if breachedHtlc.IsIncoming {
 			htlcWitnessType = input.HtlcAcceptedRevoke
 		} else {
@@ -1043,30 +1065,15 @@ func (b *breachArbiter) createJusticeTx(
 		// Grab locally scoped reference to breached output.
 		inp := &r.breachedOutputs[i]
 
-		// First, select the appropriate estimated witness weight for
+		// First, determine the appropriate estimated witness weight for
 		// the give witness type of this breached output. If the witness
-		// type is unrecognized, we will omit it from the transaction.
-		var witnessWeight int
-		switch inp.WitnessType() {
-		case input.CommitmentNoDelay:
-			witnessWeight = input.P2WKHWitnessSize
-
-		case input.CommitmentRevoke:
-			witnessWeight = input.ToLocalPenaltyWitnessSize
-
-		case input.HtlcOfferedRevoke:
-			witnessWeight = input.OfferedHtlcPenaltyWitnessSize
-
-		case input.HtlcAcceptedRevoke:
-			witnessWeight = input.AcceptedHtlcPenaltyWitnessSize
-
-		case input.HtlcSecondLevelRevoke:
-			witnessWeight = input.ToLocalPenaltyWitnessSize
-
-		default:
-			brarLog.Warnf("breached output in retribution info "+
-				"contains unexpected witness type: %v",
-				inp.WitnessType())
+		// weight cannot be estimated, we will omit it from the
+		// transaction.
+		witnessWeight, _, err := inp.WitnessType().SizeUpperBound()
+		if err != nil {
+			brarLog.Warnf("could not determine witness weight "+
+				"for breached output in retribution info: %v",
+				err)
 			continue
 		}
 		weightEstimate.AddWitnessInput(witnessWeight)
@@ -1125,6 +1132,7 @@ func (b *breachArbiter) sweepSpendableOutputsTxn(txWeight int64,
 	for _, input := range inputs {
 		txn.AddTxIn(&wire.TxIn{
 			PreviousOutPoint: *input.OutPoint(),
+			Sequence:         input.BlocksToMaturity(),
 		})
 	}
 
@@ -1231,10 +1239,10 @@ func newRetributionStore(db *channeldb.DB) *retributionStore {
 // Add adds a retribution state to the retributionStore, which is then persisted
 // to disk.
 func (rs *retributionStore) Add(ret *retributionInfo) error {
-	return rs.db.Update(func(tx *bbolt.Tx) error {
+	return kvdb.Update(rs.db, func(tx kvdb.RwTx) error {
 		// If this is our first contract breach, the retributionBucket
 		// won't exist, in which case, we just create a new bucket.
-		retBucket, err := tx.CreateBucketIfNotExists(retributionBucket)
+		retBucket, err := tx.CreateTopLevelBucket(retributionBucket)
 		if err != nil {
 			return err
 		}
@@ -1258,8 +1266,8 @@ func (rs *retributionStore) Add(ret *retributionInfo) error {
 // startup and re-register for confirmation notifications.
 func (rs *retributionStore) Finalize(chanPoint *wire.OutPoint,
 	finalTx *wire.MsgTx) error {
-	return rs.db.Update(func(tx *bbolt.Tx) error {
-		justiceBkt, err := tx.CreateBucketIfNotExists(justiceTxnBucket)
+	return kvdb.Update(rs.db, func(tx kvdb.RwTx) error {
+		justiceBkt, err := tx.CreateTopLevelBucket(justiceTxnBucket)
 		if err != nil {
 			return err
 		}
@@ -1285,8 +1293,8 @@ func (rs *retributionStore) GetFinalizedTxn(
 	chanPoint *wire.OutPoint) (*wire.MsgTx, error) {
 
 	var finalTxBytes []byte
-	if err := rs.db.View(func(tx *bbolt.Tx) error {
-		justiceBkt := tx.Bucket(justiceTxnBucket)
+	if err := kvdb.View(rs.db, func(tx kvdb.RTx) error {
+		justiceBkt := tx.ReadBucket(justiceTxnBucket)
 		if justiceBkt == nil {
 			return nil
 		}
@@ -1319,8 +1327,8 @@ func (rs *retributionStore) GetFinalizedTxn(
 // that has already been breached.
 func (rs *retributionStore) IsBreached(chanPoint *wire.OutPoint) (bool, error) {
 	var found bool
-	err := rs.db.View(func(tx *bbolt.Tx) error {
-		retBucket := tx.Bucket(retributionBucket)
+	err := kvdb.View(rs.db, func(tx kvdb.RTx) error {
+		retBucket := tx.ReadBucket(retributionBucket)
 		if retBucket == nil {
 			return nil
 		}
@@ -1344,16 +1352,16 @@ func (rs *retributionStore) IsBreached(chanPoint *wire.OutPoint) (bool, error) {
 // Remove removes a retribution state and finalized justice transaction by
 // channel point  from the retribution store.
 func (rs *retributionStore) Remove(chanPoint *wire.OutPoint) error {
-	return rs.db.Update(func(tx *bbolt.Tx) error {
-		retBucket := tx.Bucket(retributionBucket)
+	return kvdb.Update(rs.db, func(tx kvdb.RwTx) error {
+		retBucket := tx.ReadWriteBucket(retributionBucket)
 
 		// We return an error if the bucket is not already created,
 		// since normal operation of the breach arbiter should never try
 		// to remove a finalized retribution state that is not already
 		// stored in the db.
 		if retBucket == nil {
-			return errors.New("Unable to remove retribution " +
-				"because the retribution bucket doesn't exist.")
+			return errors.New("unable to remove retribution " +
+				"because the retribution bucket doesn't exist")
 		}
 
 		// Serialize the channel point we are intending to remove.
@@ -1371,7 +1379,7 @@ func (rs *retributionStore) Remove(chanPoint *wire.OutPoint) error {
 
 		// If we have not finalized this channel breach, we can exit
 		// early.
-		justiceBkt := tx.Bucket(justiceTxnBucket)
+		justiceBkt := tx.ReadWriteBucket(justiceTxnBucket)
 		if justiceBkt == nil {
 			return nil
 		}
@@ -1383,10 +1391,10 @@ func (rs *retributionStore) Remove(chanPoint *wire.OutPoint) error {
 // ForAll iterates through all stored retributions and executes the passed
 // callback function on each retribution.
 func (rs *retributionStore) ForAll(cb func(*retributionInfo) error) error {
-	return rs.db.View(func(tx *bbolt.Tx) error {
+	return kvdb.View(rs.db, func(tx kvdb.RTx) error {
 		// If the bucket does not exist, then there are no pending
 		// retributions.
-		retBucket := tx.Bucket(retributionBucket)
+		retBucket := tx.ReadBucket(retributionBucket)
 		if retBucket == nil {
 			return nil
 		}
@@ -1545,7 +1553,7 @@ func (bo *breachedOutput) Decode(r io.Reader) error {
 	if _, err := io.ReadFull(r, scratch[:2]); err != nil {
 		return err
 	}
-	bo.witnessType = input.WitnessType(
+	bo.witnessType = input.StandardWitnessType(
 		binary.BigEndian.Uint16(scratch[:2]),
 	)
 

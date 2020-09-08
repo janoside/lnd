@@ -22,12 +22,14 @@ import (
 	sphinx "github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/contractcourt"
+	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
 	"github.com/lightningnetwork/lnd/lnpeer"
 	"github.com/lightningnetwork/lnd/lntypes"
-	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/ticker"
 )
@@ -69,13 +71,13 @@ func (m *mockPreimageCache) SubscribeUpdates() *contractcourt.WitnessSubscriptio
 }
 
 type mockFeeEstimator struct {
-	byteFeeIn chan lnwallet.SatPerKWeight
+	byteFeeIn chan chainfee.SatPerKWeight
 
 	quit chan struct{}
 }
 
 func (m *mockFeeEstimator) EstimateFeePerKW(
-	numBlocks uint32) (lnwallet.SatPerKWeight, error) {
+	numBlocks uint32) (chainfee.SatPerKWeight, error) {
 
 	select {
 	case feeRate := <-m.byteFeeIn:
@@ -85,7 +87,7 @@ func (m *mockFeeEstimator) EstimateFeePerKW(
 	}
 }
 
-func (m *mockFeeEstimator) RelayFeePerKW() lnwallet.SatPerKWeight {
+func (m *mockFeeEstimator) RelayFeePerKW() chainfee.SatPerKWeight {
 	return 1e3
 }
 
@@ -97,7 +99,7 @@ func (m *mockFeeEstimator) Stop() error {
 	return nil
 }
 
-var _ lnwallet.FeeEstimator = (*mockFeeEstimator)(nil)
+var _ chainfee.Estimator = (*mockFeeEstimator)(nil)
 
 type mockForwardingLog struct {
 	sync.Mutex
@@ -126,8 +128,6 @@ type mockServer struct {
 
 	name     string
 	messages chan lnwire.Message
-
-	errChan chan error
 
 	id         [33]byte
 	htlcSwitch *Switch
@@ -172,11 +172,13 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 		FetchLastChannelUpdate: func(lnwire.ShortChannelID) (*lnwire.ChannelUpdate, error) {
 			return nil, nil
 		},
-		Notifier:              &mockNotifier{},
-		FwdEventTicker:        ticker.NewForce(DefaultFwdEventInterval),
-		LogEventTicker:        ticker.NewForce(DefaultLogInterval),
-		NotifyActiveChannel:   func(wire.OutPoint) {},
-		NotifyInactiveChannel: func(wire.OutPoint) {},
+		Notifier:       &mockNotifier{},
+		FwdEventTicker: ticker.NewForce(DefaultFwdEventInterval),
+		LogEventTicker: ticker.NewForce(DefaultLogInterval),
+		AckEventTicker: ticker.NewForce(DefaultAckInterval),
+		HtlcNotifier:   &mockHTLCNotifier{},
+		Clock:          clock.NewDefaultClock(),
+		HTLCExpiry:     time.Hour,
 	}
 
 	return New(cfg, startingHeight)
@@ -267,21 +269,26 @@ func (s *mockServer) QuitSignal() <-chan struct{} {
 // mockHopIterator represents the test version of hop iterator which instead
 // of encrypting the path in onion blob just stores the path as a list of hops.
 type mockHopIterator struct {
-	hops []ForwardingInfo
+	hops []*hop.Payload
 }
 
-func newMockHopIterator(hops ...ForwardingInfo) HopIterator {
+func newMockHopIterator(hops ...*hop.Payload) hop.Iterator {
 	return &mockHopIterator{hops: hops}
 }
 
-func (r *mockHopIterator) ForwardingInstructions() ForwardingInfo {
+func (r *mockHopIterator) HopPayload() (*hop.Payload, error) {
 	h := r.hops[0]
 	r.hops = r.hops[1:]
-	return h
+	return h, nil
+}
+
+func (r *mockHopIterator) ExtraOnionBlob() []byte {
+	return nil
 }
 
 func (r *mockHopIterator) ExtractErrorEncrypter(
-	extracter ErrorEncrypterExtracter) (ErrorEncrypter, lnwire.FailCode) {
+	extracter hop.ErrorEncrypterExtracter) (hop.ErrorEncrypter,
+	lnwire.FailCode) {
 
 	return extracter(nil)
 }
@@ -295,7 +302,8 @@ func (r *mockHopIterator) EncodeNextHop(w io.Writer) error {
 	}
 
 	for _, hop := range r.hops {
-		if err := hop.encode(w); err != nil {
+		fwdInfo := hop.ForwardingInfo()
+		if err := encodeFwdInfo(w, &fwdInfo); err != nil {
 			return err
 		}
 	}
@@ -303,7 +311,7 @@ func (r *mockHopIterator) EncodeNextHop(w io.Writer) error {
 	return nil
 }
 
-func (f *ForwardingInfo) encode(w io.Writer) error {
+func encodeFwdInfo(w io.Writer, f *hop.ForwardingInfo) error {
 	if _, err := w.Write([]byte{byte(f.Network)}); err != nil {
 		return err
 	}
@@ -323,16 +331,17 @@ func (f *ForwardingInfo) encode(w io.Writer) error {
 	return nil
 }
 
-var _ HopIterator = (*mockHopIterator)(nil)
+var _ hop.Iterator = (*mockHopIterator)(nil)
 
 // mockObfuscator mock implementation of the failure obfuscator which only
 // encodes the failure and do not makes any onion obfuscation.
 type mockObfuscator struct {
 	ogPacket *sphinx.OnionPacket
+	failure  lnwire.FailureMessage
 }
 
 // NewMockObfuscator initializes a dummy mockObfuscator used for testing.
-func NewMockObfuscator() ErrorEncrypter {
+func NewMockObfuscator() hop.ErrorEncrypter {
 	return &mockObfuscator{}
 }
 
@@ -340,8 +349,8 @@ func (o *mockObfuscator) OnionPacket() *sphinx.OnionPacket {
 	return o.ogPacket
 }
 
-func (o *mockObfuscator) Type() EncrypterType {
-	return EncrypterTypeMock
+func (o *mockObfuscator) Type() hop.EncrypterType {
+	return hop.EncrypterTypeMock
 }
 
 func (o *mockObfuscator) Encode(w io.Writer) error {
@@ -352,12 +361,16 @@ func (o *mockObfuscator) Decode(r io.Reader) error {
 	return nil
 }
 
-func (o *mockObfuscator) Reextract(extracter ErrorEncrypterExtracter) error {
+func (o *mockObfuscator) Reextract(
+	extracter hop.ErrorEncrypterExtracter) error {
+
 	return nil
 }
 
 func (o *mockObfuscator) EncryptFirstHop(failure lnwire.FailureMessage) (
 	lnwire.OpaqueReason, error) {
+
+	o.failure = failure
 
 	var b bytes.Buffer
 	if err := lnwire.EncodeFailure(&b, failure, 0); err != nil {
@@ -368,7 +381,10 @@ func (o *mockObfuscator) EncryptFirstHop(failure lnwire.FailureMessage) (
 
 func (o *mockObfuscator) IntermediateEncrypt(reason lnwire.OpaqueReason) lnwire.OpaqueReason {
 	return reason
+}
 
+func (o *mockObfuscator) EncryptMalformedError(reason lnwire.OpaqueReason) lnwire.OpaqueReason {
+	return reason
 }
 
 // mockDeobfuscator mock implementation of the failure deobfuscator which
@@ -387,9 +403,7 @@ func (o *mockDeobfuscator) DecryptError(reason lnwire.OpaqueReason) (*Forwarding
 		return nil, err
 	}
 
-	return &ForwardingError{
-		FailureMessage: failure,
-	}, nil
+	return NewForwardingError(failure, 1), nil
 }
 
 var _ ErrorDecrypter = (*mockDeobfuscator)(nil)
@@ -399,17 +413,19 @@ var _ ErrorDecrypter = (*mockDeobfuscator)(nil)
 type mockIteratorDecoder struct {
 	mu sync.RWMutex
 
-	responses map[[32]byte][]DecodeHopIteratorResponse
+	responses map[[32]byte][]hop.DecodeHopIteratorResponse
+
+	decodeFail bool
 }
 
 func newMockIteratorDecoder() *mockIteratorDecoder {
 	return &mockIteratorDecoder{
-		responses: make(map[[32]byte][]DecodeHopIteratorResponse),
+		responses: make(map[[32]byte][]hop.DecodeHopIteratorResponse),
 	}
 }
 
 func (p *mockIteratorDecoder) DecodeHopIterator(r io.Reader, rHash []byte,
-	cltv uint32) (HopIterator, lnwire.FailCode) {
+	cltv uint32) (hop.Iterator, lnwire.FailCode) {
 
 	var b [4]byte
 	_, err := r.Read(b[:])
@@ -418,21 +434,30 @@ func (p *mockIteratorDecoder) DecodeHopIterator(r io.Reader, rHash []byte,
 	}
 	hopLength := binary.BigEndian.Uint32(b[:])
 
-	hops := make([]ForwardingInfo, hopLength)
+	hops := make([]*hop.Payload, hopLength)
 	for i := uint32(0); i < hopLength; i++ {
-		f := &ForwardingInfo{}
-		if err := f.decode(r); err != nil {
+		var f hop.ForwardingInfo
+		if err := decodeFwdInfo(r, &f); err != nil {
 			return nil, lnwire.CodeTemporaryChannelFailure
 		}
 
-		hops[i] = *f
+		var nextHopBytes [8]byte
+		binary.BigEndian.PutUint64(nextHopBytes[:], f.NextHop.ToUint64())
+
+		hops[i] = hop.NewLegacyPayload(&sphinx.HopData{
+			Realm:         [1]byte{}, // hop.BitcoinNetwork
+			NextAddress:   nextHopBytes,
+			ForwardAmount: uint64(f.AmountToForward),
+			OutgoingCltv:  f.OutgoingCTLV,
+		})
 	}
 
 	return newMockHopIterator(hops...), lnwire.CodeNone
 }
 
 func (p *mockIteratorDecoder) DecodeHopIterators(id []byte,
-	reqs []DecodeHopIteratorRequest) ([]DecodeHopIteratorResponse, error) {
+	reqs []hop.DecodeHopIteratorRequest) (
+	[]hop.DecodeHopIteratorResponse, error) {
 
 	idHash := sha256.Sum256(id)
 
@@ -445,13 +470,17 @@ func (p *mockIteratorDecoder) DecodeHopIterators(id []byte,
 
 	batchSize := len(reqs)
 
-	resps := make([]DecodeHopIteratorResponse, 0, batchSize)
+	resps := make([]hop.DecodeHopIteratorResponse, 0, batchSize)
 	for _, req := range reqs {
 		iterator, failcode := p.DecodeHopIterator(
 			req.OnionReader, req.RHash, req.IncomingCltv,
 		)
 
-		resp := DecodeHopIteratorResponse{
+		if p.decodeFail {
+			failcode = lnwire.CodeTemporaryChannelFailure
+		}
+
+		resp := hop.DecodeHopIteratorResponse{
 			HopIterator: iterator,
 			FailCode:    failcode,
 		}
@@ -465,12 +494,12 @@ func (p *mockIteratorDecoder) DecodeHopIterators(id []byte,
 	return resps, nil
 }
 
-func (f *ForwardingInfo) decode(r io.Reader) error {
+func decodeFwdInfo(r io.Reader, f *hop.ForwardingInfo) error {
 	var net [1]byte
 	if _, err := r.Read(net[:]); err != nil {
 		return err
 	}
-	f.Network = NetworkHop(net[0])
+	f.Network = hop.Network(net[0])
 
 	if err := binary.Read(r, binary.BigEndian, &f.NextHop); err != nil {
 		return err
@@ -575,7 +604,13 @@ func (s *mockServer) AddNewChannel(channel *channeldb.OpenChannel,
 	return nil
 }
 
-func (s *mockServer) WipeChannel(*wire.OutPoint) error {
+func (s *mockServer) WipeChannel(*wire.OutPoint) {}
+
+func (s *mockServer) LocalFeatures() *lnwire.FeatureVector {
+	return nil
+}
+
+func (s *mockServer) RemoteFeatures() *lnwire.FeatureVector {
 	return nil
 }
 
@@ -603,8 +638,6 @@ type mockChannelLink struct {
 
 	peer lnpeer.Peer
 
-	startMailBox bool
-
 	mailBox MailBox
 
 	packets chan *htlcPacket
@@ -612,6 +645,10 @@ type mockChannelLink struct {
 	eligible bool
 
 	htlcID uint64
+
+	checkHtlcTransitResult *LinkError
+
+	checkHtlcForwardResult *LinkError
 }
 
 // completeCircuit is a helper method for adding the finalized payment circuit
@@ -665,14 +702,27 @@ func (f *mockChannelLink) HandleSwitchPacket(pkt *htlcPacket) error {
 	return nil
 }
 
+func (f *mockChannelLink) HandleLocalAddPacket(pkt *htlcPacket) error {
+	_ = f.mailBox.AddPacket(pkt)
+	return nil
+}
+
 func (f *mockChannelLink) HandleChannelUpdate(lnwire.Message) {
 }
 
 func (f *mockChannelLink) UpdateForwardingPolicy(_ ForwardingPolicy) {
 }
-func (f *mockChannelLink) HtlcSatifiesPolicy([32]byte, lnwire.MilliSatoshi,
-	lnwire.MilliSatoshi, uint32, uint32, uint32) lnwire.FailureMessage {
-	return nil
+func (f *mockChannelLink) CheckHtlcForward([32]byte, lnwire.MilliSatoshi,
+	lnwire.MilliSatoshi, uint32, uint32, uint32) *LinkError {
+
+	return f.checkHtlcForwardResult
+}
+
+func (f *mockChannelLink) CheckHtlcTransit(payHash [32]byte,
+	amt lnwire.MilliSatoshi, timeout uint32,
+	heightNow uint32) *LinkError {
+
+	return f.checkHtlcTransitResult
 }
 
 func (f *mockChannelLink) Stats() (uint64, lnwire.MilliSatoshi, lnwire.MilliSatoshi) {
@@ -728,6 +778,8 @@ func newDB() (*channeldb.DB, func(), error) {
 	return cdb, cleanUp, nil
 }
 
+const testInvoiceCltvExpiry = 6
+
 type mockInvoiceRegistry struct {
 	settleChan chan lntypes.Hash
 
@@ -742,11 +794,13 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		panic(err)
 	}
 
-	decodeExpiry := func(invoice string) (uint32, error) {
-		return 3, nil
-	}
-
-	registry := invoices.NewRegistry(cdb, decodeExpiry)
+	registry := invoices.NewRegistry(
+		cdb,
+		invoices.NewInvoiceExpiryWatcher(clock.NewDefaultClock()),
+		&invoices.RegistryConfig{
+			FinalCltvRejectDelta: 5,
+		},
+	)
 	registry.Start()
 
 	return &mockInvoiceRegistry{
@@ -755,7 +809,9 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 	}
 }
 
-func (i *mockInvoiceRegistry) LookupInvoice(rHash lntypes.Hash) (channeldb.Invoice, uint32, error) {
+func (i *mockInvoiceRegistry) LookupInvoice(rHash lntypes.Hash) (
+	channeldb.Invoice, error) {
+
 	return i.registry.LookupInvoice(rHash)
 }
 
@@ -764,10 +820,14 @@ func (i *mockInvoiceRegistry) SettleHodlInvoice(preimage lntypes.Preimage) error
 }
 
 func (i *mockInvoiceRegistry) NotifyExitHopHtlc(rhash lntypes.Hash,
-	amt lnwire.MilliSatoshi, hodlChan chan<- interface{}) (
-	*invoices.HodlEvent, error) {
+	amt lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
+	circuitKey channeldb.CircuitKey, hodlChan chan<- interface{},
+	payload invoices.Payload) (invoices.HtlcResolution, error) {
 
-	event, err := i.registry.NotifyExitHopHtlc(rhash, amt, hodlChan)
+	event, err := i.registry.NotifyExitHopHtlc(
+		rhash, amt, expiry, currentHeight, circuitKey, hodlChan,
+		payload,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -799,7 +859,9 @@ type mockSigner struct {
 	key *btcec.PrivateKey
 }
 
-func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx, signDesc *input.SignDescriptor) ([]byte, error) {
+func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx,
+	signDesc *input.SignDescriptor) (input.Signature, error) {
+
 	amt := signDesc.Output.Value
 	witnessScript := signDesc.WitnessScript
 	privKey := m.key
@@ -824,7 +886,7 @@ func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx, signDesc *input.SignDescripto
 		return nil, err
 	}
 
-	return sig[:len(sig)-1], nil
+	return btcec.ParseDERSignature(sig[:len(sig)-1], btcec.S256())
 }
 func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx, signDesc *input.SignDescriptor) (*input.Script, error) {
 
@@ -874,6 +936,10 @@ func (m *mockNotifier) Start() error {
 	return nil
 }
 
+func (m *mockNotifier) Started() bool {
+	return true
+}
+
 func (m *mockNotifier) Stop() error {
 	return nil
 }
@@ -884,4 +950,93 @@ func (m *mockNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint, _ []byte,
 	return &chainntnfs.SpendEvent{
 		Spend: make(chan *chainntnfs.SpendDetail),
 	}, nil
+}
+
+type mockCircuitMap struct {
+	lookup chan *PaymentCircuit
+}
+
+var _ CircuitMap = (*mockCircuitMap)(nil)
+
+func (m *mockCircuitMap) OpenCircuits(...Keystone) error {
+	return nil
+}
+
+func (m *mockCircuitMap) TrimOpenCircuits(chanID lnwire.ShortChannelID,
+	start uint64) error {
+	return nil
+}
+
+func (m *mockCircuitMap) DeleteCircuits(inKeys ...CircuitKey) error {
+	return nil
+}
+
+func (m *mockCircuitMap) CommitCircuits(
+	circuit ...*PaymentCircuit) (*CircuitFwdActions, error) {
+
+	return nil, nil
+}
+
+func (m *mockCircuitMap) CloseCircuit(outKey CircuitKey) (*PaymentCircuit,
+	error) {
+	return nil, nil
+}
+
+func (m *mockCircuitMap) FailCircuit(inKey CircuitKey) (*PaymentCircuit,
+	error) {
+	return nil, nil
+}
+
+func (m *mockCircuitMap) LookupCircuit(inKey CircuitKey) *PaymentCircuit {
+	return <-m.lookup
+}
+
+func (m *mockCircuitMap) LookupOpenCircuit(outKey CircuitKey) *PaymentCircuit {
+	return nil
+}
+
+func (m *mockCircuitMap) LookupByPaymentHash(hash [32]byte) []*PaymentCircuit {
+	return nil
+}
+
+func (m *mockCircuitMap) NumPending() int {
+	return 0
+}
+
+func (m *mockCircuitMap) NumOpen() int {
+	return 0
+}
+
+type mockOnionErrorDecryptor struct {
+	sourceIdx int
+	message   []byte
+	err       error
+}
+
+func (m *mockOnionErrorDecryptor) DecryptError(encryptedData []byte) (
+	*sphinx.DecryptedError, error) {
+
+	return &sphinx.DecryptedError{
+		SenderIdx: m.sourceIdx,
+		Message:   m.message,
+	}, m.err
+}
+
+var _ htlcNotifier = (*mockHTLCNotifier)(nil)
+
+type mockHTLCNotifier struct{}
+
+func (h *mockHTLCNotifier) NotifyForwardingEvent(key HtlcKey, info HtlcInfo,
+	eventType HtlcEventType) {
+}
+
+func (h *mockHTLCNotifier) NotifyLinkFailEvent(key HtlcKey, info HtlcInfo,
+	eventType HtlcEventType, linkErr *LinkError, incoming bool) {
+}
+
+func (h *mockHTLCNotifier) NotifyForwardingFailEvent(key HtlcKey,
+	eventType HtlcEventType) {
+}
+
+func (h *mockHTLCNotifier) NotifySettleEvent(key HtlcKey, eventType HtlcEventType) {
 }

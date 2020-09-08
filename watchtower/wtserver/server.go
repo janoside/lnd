@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/connmgr"
 	"github.com/btcsuite/btcutil"
+	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/watchtower/wtdb"
 	"github.com/lightningnetwork/lnd/watchtower/wtwire"
@@ -33,9 +33,9 @@ type Config struct {
 	// storing state updates.
 	DB DB
 
-	// NodePrivKey is private key to be used in accepting new brontide
-	// connections.
-	NodePrivKey *btcec.PrivateKey
+	// NodeKeyECDH is the the ECDH capable wrapper of the key to be used in
+	// accepting new brontide connections.
+	NodeKeyECDH keychain.SingleKeyECDH
 
 	// Listeners specifies which address to which clients may connect.
 	Listeners []net.Listener
@@ -56,9 +56,17 @@ type Config struct {
 	// ChainHash identifies the network that the server is watching.
 	ChainHash chainhash.Hash
 
+	// NoAckCreateSession causes the server to not reply to create session
+	// requests, this should only be used for testing.
+	NoAckCreateSession bool
+
 	// NoAckUpdates causes the server to not acknowledge state updates, this
 	// should only be used for testing.
 	NoAckUpdates bool
+
+	// DisableReward causes the server to reject any session creation
+	// attempts that request rewards.
+	DisableReward bool
 }
 
 // Server houses the state required to handle watchtower peers. It's primary job
@@ -88,7 +96,7 @@ type Server struct {
 // sessions and send state updates.
 func New(cfg *Config) (*Server, error) {
 	localInit := wtwire.NewInitMessage(
-		lnwire.NewRawFeatureVector(wtwire.WtSessionsOptional),
+		lnwire.NewRawFeatureVector(wtwire.AltruistSessionsOptional),
 		cfg.ChainHash,
 	)
 
@@ -283,12 +291,12 @@ func (s *Server) handleClient(peer Peer) {
 // error code.
 type connFailure struct {
 	ID   wtdb.SessionID
-	Code uint16
+	Code wtwire.ErrorCode
 }
 
 // Error displays the SessionID and Code that caused the connection failure.
 func (f *connFailure) Error() string {
-	return fmt.Sprintf("connection with %s failed with code=%v",
+	return fmt.Sprintf("connection with %s failed with code=%s",
 		f.ID, f.Code,
 	)
 }

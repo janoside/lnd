@@ -1,12 +1,20 @@
 DEV_TAGS = dev
+RPC_TAGS = autopilotrpc chainrpc invoicesrpc routerrpc signrpc verrpc walletrpc watchtowerrpc wtclientrpc
 LOG_TAGS =
 TEST_FLAGS =
+COVER_PKG = $$(go list -deps ./... | grep '$(PKG)' | grep -v lnrpc)
+
+# If rpc option is set also add all extra RPC tags to DEV_TAGS
+ifneq ($(with-rpc),)
+DEV_TAGS += $(RPC_TAGS)
+endif
 
 # If specific package is being unit tested, construct the full name of the
 # subpackage.
 ifneq ($(pkg),)
 UNITPKG := $(PKG)/$(pkg)
 UNIT_TARGETED = yes
+COVER_PKG = $(PKG)/$(pkg)
 endif
 
 # If a specific unit test case is being target, construct test.run filter.
@@ -33,7 +41,7 @@ endif
 ifneq ($(timeout),)
 TEST_FLAGS += -test.timeout=$(timeout)
 else
-TEST_FLAGS += -test.timeout=20m
+TEST_FLAGS += -test.timeout=40m
 endif
 
 # UNIT_TARGTED is undefined iff a specific package and/or unit test case is
@@ -53,6 +61,12 @@ UNIT_RACE := $(UNIT) -race
 endif
 
 
+# Default to btcd backend if not set.
+ifeq ($(backend),)
+backend = btcd
+endif
+
 # Construct the integration test command with the added build flags.
-ITEST_TAGS := $(DEV_TAGS) rpctest chainrpc walletrpc signrpc invoicesrpc autopilotrpc routerrpc
-ITEST := rm output*.log; date; $(GOTEST) -tags="$(ITEST_TAGS)" $(TEST_FLAGS) -logoutput
+ITEST_TAGS := $(DEV_TAGS) $(RPC_TAGS) rpctest $(backend)
+
+ITEST := rm lntest/itest/*.log; date; $(GOTEST) -v ./lntest/itest -tags="$(ITEST_TAGS)" $(TEST_FLAGS) -logoutput -goroutinedump
